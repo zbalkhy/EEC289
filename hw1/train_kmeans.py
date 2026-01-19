@@ -1,0 +1,66 @@
+import numpy as np
+import torch
+import torchvision.datasets as datasets
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+import gzip
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import normalize
+import joblib
+import concurrent.futures
+
+
+def preprocess_patches(patches):
+    
+    # flatten patches to (N,25)
+    patch_vectors = patches.view(patches.shape[0], -1).numpy()
+    
+    # normalize patches
+    patch_vectors = normalize(patch_vectors, norm='l2')
+    return patch_vectors
+
+def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=None):
+    """
+    Apply k-means clustering to 5x5 image patches.
+    
+    Args:
+        patches: torch tensor of shape (N, 5, 5) where N is number of patches
+        n_clusters: number of clusters (K)
+        normalize_patches: whether to normalize patches to unit norm
+        sample_size: if not None, randomly sample this many patches for clustering
+    
+    Returns:
+        kmeans: fitted KMeans object
+        cluster_centers: cluster centers reshaped back to (n_clusters, 5, 5)
+    """
+    if sample_size is not None and sample_size < len(patches):
+        # Randomly sample patches
+        indices = np.random.choice(len(patches), sample_size, replace=False)
+        patches = patches[indices]
+    
+    # Apply k-means
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans.fit(patches)
+    
+    # Reshape cluster centers back to (5, 5)
+    #cluster_centers = kmeans.cluster_centers_.reshape(n_clusters, 5, 5)
+    
+    return kmeans
+
+
+if __name__=="__main__":
+
+    with gzip.open('./data/patches.pt.gz', 'rb') as f:
+        patches = torch.load(f)
+
+    # Apply k-means with K=100 on a sample of 10,000 patches
+    patch_vectors = preprocess_patches(patches)
+
+    def process_cluster(n_clusters):
+        kmeans = apply_kmeans_to_patches(patch_vectors, n_clusters=n_clusters)
+        joblib.dump(kmeans, f"kmeans_{n_clusters}.pkl")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+        futures = [executor.submit(process_cluster, nc) for nc in np.arange(100, 10100, 100)]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
