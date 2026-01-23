@@ -4,7 +4,7 @@ import torchvision.datasets as datasets
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 import gzip
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import normalize
 import joblib
 import concurrent.futures
@@ -19,7 +19,7 @@ def preprocess_patches(patches):
     patch_vectors = normalize(patch_vectors, norm='l2')
     return patch_vectors
 
-def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=None):
+def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
     """
     Apply k-means clustering to 5x5 image patches.
     
@@ -39,7 +39,7 @@ def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=None):
         patches = patches[indices]
     
     # Apply k-means
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     kmeans.fit(patches)
     
     # Reshape cluster centers back to (5, 5)
@@ -56,11 +56,19 @@ if __name__=="__main__":
     # Apply k-means with K=100 on a sample of 10,000 patches
     patch_vectors = preprocess_patches(patches)
 
-    def process_cluster(n_clusters):
-        kmeans = apply_kmeans_to_patches(patch_vectors, n_clusters=n_clusters)
-        joblib.dump(kmeans, f"kmeans_{n_clusters}.pkl")
+    for i in tqdm(np.arange(1000,10000, 1000)):
+        centroids = apply_kmeans_to_patches(patch_vectors, i)
+        with gzip.open(f'./data/centroids_scik_{i}.pt.gz', 'wb') as f:
+            torch.save(centroids, f)
+            del centroids
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
-        futures = [executor.submit(process_cluster, nc) for nc in np.arange(100, 10100, 100)]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
+    # def process_cluster(n_clusters, patch_vectors):
+    #     print(f"start {n_clusters}")
+    #     kmeans = apply_kmeans_to_patches(patch_vectors, n_clusters=n_clusters)
+    #     print(f"trained {n_clusters} clusters")
+    #     joblib.dump(kmeans, f"kmeans_{n_clusters}.pkl")
+
+    # with concurrent.futures.ProcessPoolExecutor(max_workers=30) as executor:
+    #     futures = [executor.submit(process_cluster, nc, patch_vectors) for nc in np.arange(10, 1010, 100)]
+    #     for future in concurrent.futures.as_completed(futures):
+    #         future.result()
