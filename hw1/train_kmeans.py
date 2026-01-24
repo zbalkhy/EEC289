@@ -8,15 +8,23 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.preprocessing import normalize
 import joblib
 import concurrent.futures
-
+from sklearn.decomposition import PCA
 
 def preprocess_patches(patches):
     
+    print("flatten patches")
     # flatten patches to (N,25)
     patch_vectors = patches.view(patches.shape[0], -1).numpy()
     
+    print("normalize patches")
     # normalize patches
     patch_vectors = normalize(patch_vectors, norm='l2')
+    
+    print("whiten patches")
+    # whiten patches
+    pca = PCA(whiten=True)
+    patch_vectors = pca.fit_transform(patch_vectors)   
+    
     return patch_vectors
 
 def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
@@ -56,19 +64,8 @@ if __name__=="__main__":
     # Apply k-means with K=100 on a sample of 10,000 patches
     patch_vectors = preprocess_patches(patches)
 
-    for i in tqdm(np.arange(1000,10000, 1000)):
-        centroids = apply_kmeans_to_patches(patch_vectors, i)
-        with gzip.open(f'./data/centroids_scik_{i}.pt.gz', 'wb') as f:
-            torch.save(centroids, f)
-            del centroids
-
-    # def process_cluster(n_clusters, patch_vectors):
-    #     print(f"start {n_clusters}")
-    #     kmeans = apply_kmeans_to_patches(patch_vectors, n_clusters=n_clusters)
-    #     print(f"trained {n_clusters} clusters")
-    #     joblib.dump(kmeans, f"kmeans_{n_clusters}.pkl")
-
-    # with concurrent.futures.ProcessPoolExecutor(max_workers=30) as executor:
-    #     futures = [executor.submit(process_cluster, nc, patch_vectors) for nc in np.arange(10, 1010, 100)]
-    #     for future in concurrent.futures.as_completed(futures):
-    #         future.result()
+    n_clusters = np.concat((np.array([100]),np.arange(1000,11000,1000)))
+    for i in tqdm(n_clusters):
+        kmeans = apply_kmeans_to_patches(patch_vectors, i, sample_size=None)
+        joblib.dump(kmeans, f"kmeans_{i}.pkl")
+        del kmeans
