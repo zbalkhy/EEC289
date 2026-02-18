@@ -57,6 +57,9 @@ def make_grid(parsed, save_path, img_number=0, trials=(0,1,2), ):
 
     # Prepare figure
     fig, axes = plt.subplots(rows, cols, figsize=(cols*2.5, rows*2.5))
+    fig.suptitle(f"Generated images based off of texture {img_number}")
+    plt.subplots_adjust(hspace=-0.9)
+
     if rows == 1 and cols == 1:
         axes = np.array([[axes]])
     elif rows == 1:
@@ -90,9 +93,10 @@ def make_grid(parsed, save_path, img_number=0, trials=(0,1,2), ):
                 ax.imshow(img_disp)
             ax.set_xticks([])
             ax.set_yticks([])
-            ax.set_title(f"{c1},{c2}")
+            ax.set_title(f"window_size={c1},eps={c2}")
 
     plt.tight_layout()
+    
     full_path=os.path.join(save_path, f"all_images_img{img_number}.png")
     fig.savefig(full_path, dpi=150)
     print(f"Saved combined figure to: {full_path}")
@@ -101,12 +105,13 @@ def make_grid(parsed, save_path, img_number=0, trials=(0,1,2), ):
 if __name__ == '__main__':
     HW2_DIR = os.path.dirname(__file__)
     SAVE_PATH = os.path.join(HW2_DIR, "all_images_img")
-    generated_dir = '/home/zbalkhy/EEC289/hw2/content/generated'
+    generated_dir = '/home/zbalkhy/EEC289/hw2/content/generated_2_17'
     dirs = [d for d in os.listdir(generated_dir)] 
     for d in dirs:
-        subdir = os.path.join(generated_dir,d)
-        parsed = find_files(subdir)
-        if len(parsed) == 0:
-            print('No .pt files found in', subdir)
-        else:
-            make_grid(parsed, HW2_DIR, img_number=int(d))
+        if int(d) in [11]:
+            subdir = os.path.join(generated_dir,d)
+            parsed = find_files(subdir)
+            if len(parsed) == 0:
+                print('No .pt files found in', subdir)
+            else:
+                make_grid(parsed, HW2_DIR, img_number=int(d))
