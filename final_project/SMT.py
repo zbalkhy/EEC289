@@ -6,6 +6,14 @@ from typing import Iterable
 import librosa
 import numpy as np
 
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize
+from tqdm import tqdm
+
+from scipy.sparse import csr_matrix
+from scipy.linalg import eigh
+
 
 def extract_mel_and_mfcc(
     audio_path: str | Path,
@@ -59,7 +67,6 @@ def extract_mel_and_mfcc(
         "mfcc": mfcc,
     }
 
-
 def extract_features_from_files(
     audio_paths: Iterable[str | Path],
     n_mels: int = 40,
@@ -79,7 +86,6 @@ def extract_features_from_files(
             hop_ms=hop_ms,
         )
     return results
-
 
 def extract_time_patches(
     features: np.ndarray,
@@ -118,34 +124,163 @@ def extract_time_patches(
     patches = [features[:, s : s + patch_frames] for s in starts]
     return np.stack(patches, axis=0)
 
-
-def extract_300ms_patches_from_feature_dict(
-    feature_dict: dict[str, np.ndarray | int],
-    feature_key: str = "mfcc",
-    patch_hop_frames: int = 1,
-) -> np.ndarray:
+def zca_whitening_matrix(X):
     """
-    Extract 300 ms patches from the selected feature in extract_mel_and_mfcc output.
+    Function to compute ZCA whitening matrix (aka Mahalanobis whitening).
+    INPUT:  X: [M x N] matrix.
+        Rows: Variables
+        Columns: Observations
+    OUTPUT: ZCAMatrix: [M x M] matrix
+    """
+    # Covariance matrix [column-wise variables]: Sigma = (X-mu)' * (X-mu) / N
+    sigma = np.cov(X, rowvar=True) # [M x M]
+    # Singular Value Decomposition. X = U * np.diag(S) * V
+    U,S,V = np.linalg.svd(sigma)
+        # U: [M x M] eigenvectors of sigma.
+        # S: [M x 1] eigenvalues of sigma.
+        # V: [M x M] transpose of U
+    # Whitening constant: prevents division by zero
+    epsilon = 1e-5
+    # ZCA Whitening matrix: U * Lambda * U'
+    ZCAMatrix = np.dot(U, np.dot(np.diag(1.0/np.sqrt(S + epsilon)), U.T)) # [M x M]
+    return ZCAMatrix
 
+def preprocess_patches(patches: np.ndarray):
+    
+    # flatten patches to (N,40*30)
+    patch_vectors = patches.reshape(patches.shape[0], -1)
+    print(patch_vectors.shape)
+    # subtract mean from patches
+    mean = np.mean(patch_vectors, axis=1)
+    std = np.std(patch_vectors, axis=1)
+    patch_vectors = ((patch_vectors.T - mean)/(std + 1e-6)).T
+    
+    # whiten patches
+    #pca = PCA(whiten=True)
+    #patch_vectors = pca.fit_transform(patch_vectors)   
+    zcaMatrix = zca_whitening_matrix(patch_vectors.T)
+    patch_vectors = np.dot(zcaMatrix, patch_vectors.T) # project X onto the ZCAMatrix
+    patch_vectors = patch_vectors.T
+
+    # normalize patches
+    patch_vectors = normalize(patch_vectors, norm='l2')
+    
+    return patch_vectors, mean, zcaMatrix
+
+def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
+    """
+    Apply k-means clustering to 5x5 image patches.
+    
     Args:
-        feature_dict: Output dictionary from extract_mel_and_mfcc.
-        feature_key: One of {"mfcc", "mel_spectrogram", "log_mel_db"}.
-        patch_hop_frames: Step size between consecutive patches in frames.
-
+        patches: torch tensor of shape (N, 5, 5) where N is number of patches
+        n_clusters: number of clusters (K)
+        normalize_patches: whether to normalize patches to unit norm
+        sample_size: if not None, randomly sample this many patches for clustering
+    
     Returns:
-        3D array [n_patches, n_features, patch_frames].
+        kmeans: fitted KMeans object
+        cluster_centers: cluster centers reshaped back to (n_clusters, 5, 5)
     """
-    if "sr" not in feature_dict:
-        raise KeyError("feature_dict is missing 'sr'.")
-    if "hop_length" not in feature_dict:
-        raise KeyError("feature_dict is missing 'hop_length'.")
-    if feature_key not in feature_dict:
-        raise KeyError(f"feature_dict is missing '{feature_key}'.")
+    if sample_size is not None and sample_size < len(patches):
+        # Randomly sample patches
+        indices = np.random.choice(len(patches), sample_size, replace=False)
+        patches = patches[indices]
+    
+    # Apply k-means
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=43, n_init=10)
+    kmeans.fit(patches)
+    return kmeans
 
-    return extract_time_patches(
-        features=np.asarray(feature_dict[feature_key]),
-        sr=int(feature_dict["sr"]),
-        hop_length=int(feature_dict["hop_length"]),
-        patch_ms=300.0,
-        patch_hop_frames=patch_hop_frames,
+def spectral_decomp(labels: np.ndarray, utterance_bounds: list, n_clusters: int):
+    """
+    we are solving a generalized eigen value decomposition problem: Mu=λVu
+    where: 
+    M=ADD^TA^T (slowness matrix)
+    V=(1/N)A^TA+εI (whitening / covariance constraint)
+
+    to avoid gigantic matrices we calculate M by formulating D as a 1D laplacian and summing over the edges of the chain
+    """
+    
+    n_samples = labels.shape[0]
+
+    # Sparse cluster code: shape (n_samples, n_clusters)
+    A = csr_matrix(
+        (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
+        shape=(n_samples, n_clusters),
     )
+
+    # M = A@D@D.T@A.T
+    M = np.zeros((A.shape[1], A.shape[1]))
+    for (start, end) in utterance_bounds:
+        for j in tqdm(range(start, end - 1)):
+            if j+1 < A.shape[0]:
+                diff = (A[j+1] - A[j]).T
+                M += diff@(diff.T)
+    
+    A = A.T # transpose A to match smt formulation
+
+    # calculate the constraint
+    n_samples = A.shape[1]
+    eps = 1e-6
+    V = (A @ A.T) / n_samples
+    V += eps * np.eye(V.shape[0]) # regularization which is probably necessary for 1-sparse codes
+
+    # solve the spectral decomposition
+    eigvals, eigvecs = eigh(M, V)
+    return eigvals, eigvecs
+
+def plot_first_n_mel_patches(mel_patches, n_show=10, cols=5, cmap='magma'):
+    """Plot the first n_show mel patches in a single figure grid."""
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    mel_patches = np.asarray(mel_patches)
+    if mel_patches.ndim != 3:
+        raise ValueError('mel_patches must have shape [n_patches, n_mels, n_frames].')
+
+    n_show = min(n_show, mel_patches.shape[0])
+    if n_show == 0:
+        raise ValueError('mel_patches is empty.')
+
+    rows = int(np.ceil(n_show / cols))
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(3 * cols, 2.5 * rows),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    axes_flat = axes.ravel()
+
+    for i in range(n_show):
+        ax = axes_flat[i]
+        im = ax.imshow(mel_patches[i], origin='lower', aspect='auto', cmap=cmap)
+        ax.set_title(f'Patch {i}')
+        ax.set_xlabel('Frame')
+        ax.set_ylabel('Mel bin')
+
+    for j in range(n_show, len(axes_flat)):
+        axes_flat[j].axis('off')
+
+    # fig.colorbar(im, ax=axes, location='right', fraction=0.03, pad=0.02, label='Power')
+    fig.suptitle(f'First {n_show} Mel-Spectrogram Patches')
+    plt.show()
+
+def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length):
+    patches = []
+    utterance_bounds = []
+    start = 0
+    for mel in mels:
+        p = extract_time_patches(
+            features=mel,
+            sr=sr,
+            hop_length=hop_length,
+            patch_ms=300.0,
+            patch_hop_frames=1,
+        )
+        end = start + p.shape[0]
+        patches.append(p)
+        utterance_bounds.append((start, end))
+        start = end
+    patches = np.concat(patches)
+    return patches, utterance_bounds
