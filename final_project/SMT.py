@@ -148,24 +148,25 @@ def zca_whitening_matrix(X):
 def preprocess_patches(patches: np.ndarray):
     
     # flatten patches to (N,40*30)
-    patch_vectors = patches.reshape(patches.shape[0], -1)
-    print(patch_vectors.shape)
+    if len(patches.shape)>=3:
+        patches = patches.reshape(patches.shape[0], -1)
+    
     # subtract mean from patches
-    mean = np.mean(patch_vectors, axis=1)
-    std = np.std(patch_vectors, axis=1)
-    patch_vectors = ((patch_vectors.T - mean)/(std + 1e-6)).T
+    mean = np.mean(patches, axis=0)
+    std = np.std(patches, axis=0)
+    patches = (patches - mean)/(std + 1e-6)
     
     # whiten patches
     #pca = PCA(whiten=True)
     #patch_vectors = pca.fit_transform(patch_vectors)   
-    zcaMatrix = zca_whitening_matrix(patch_vectors.T)
-    patch_vectors = np.dot(zcaMatrix, patch_vectors.T) # project X onto the ZCAMatrix
-    patch_vectors = patch_vectors.T
+    zcaMatrix = zca_whitening_matrix(patches.T)
+    patches = np.dot(zcaMatrix, patches.T) # project X onto the ZCAMatrix
+    patches = patches.T
 
     # normalize patches
-    patch_vectors = normalize(patch_vectors, norm='l2')
+    patches = normalize(patches, norm='l2')
     
-    return patch_vectors, mean, zcaMatrix
+    return patches, mean, zcaMatrix
 
 def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
     """
