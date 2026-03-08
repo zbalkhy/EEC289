@@ -267,7 +267,7 @@ def plot_first_n_mel_patches(mel_patches, n_show=10, cols=5, cmap='magma'):
     fig.suptitle(f'First {n_show} Mel-Spectrogram Patches')
     plt.show()
 
-def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length):
+def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_length=300):
     patches = []
     utterance_bounds = []
     start = 0
@@ -276,7 +276,7 @@ def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length):
             features=mel,
             sr=sr,
             hop_length=hop_length,
-            patch_ms=300.0,
+            patch_ms=patch_length,
             patch_hop_frames=1,
         )
         end = start + p.shape[0]
