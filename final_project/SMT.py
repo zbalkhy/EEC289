@@ -213,7 +213,7 @@ def spectral_decomp(labels: np.ndarray, utterance_bounds: list, n_clusters: int)
     # M = A@D@D.T@A.T
     M = np.zeros((A.shape[1], A.shape[1]))
     for (start, end) in utterance_bounds:
-        for j in tqdm(range(start, end - 1)):
+        for j in tqdm(range(start, end - 1), leave=False):
             if j+1 < A.shape[0]:
                 diff = (A[j+1] - A[j]).T
                 M += diff@(diff.T)
@@ -285,3 +285,130 @@ def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_leng
         start = end
     patches = np.concat(patches)
     return patches, utterance_bounds
+
+def list_audio_files(audio_dir: Path):
+    # Common audio extensions
+    exts = (".wav", ".mp3", ".ogg", ".flac")
+    return [p for p in sorted(audio_dir.rglob("*")) if p.is_file() and p.suffix.lower() in exts]
+
+def calc_smoothness(data: np.ndarray):
+    # assume data is NxD where N is the number of samples
+    diff = np.diff(data, axis=0)
+    diff_2 = np.diff(data, n=2, axis=0)
+
+    grad_norm = np.linalg.norm(diff, ord=2, axis=1)
+    grad_norm_2 = np.linalg.norm(diff_2, ord=2, axis=1)
+    grad_median = np.median(grad_norm)
+    grad_2_median = np.median(grad_norm_2)
+    return grad_median, grad_2_median
+
+def block_permute_rows(X, block_size, rng=None):
+    """
+    Permute rows of X by shuffling contiguous blocks.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Array of shape (n_rows, ...).
+    block_size : int
+        Number of rows per block.
+    rng : np.random.Generator or None
+        Optional RNG for reproducibility.
+
+    Returns
+    -------
+    X_perm : np.ndarray
+        Block-permuted array.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_rows = X.shape[0]
+    n_blocks = n_rows // block_size
+
+    # Trim extra rows that don't fit into a full block
+    trimmed = X[:n_blocks * block_size]
+
+    blocks = trimmed.reshape(n_blocks, block_size, *X.shape[1:])
+    perm = rng.permutation(n_blocks)
+
+    permuted = blocks[perm].reshape(-1, *X.shape[1:])
+
+    # Append leftover rows unchanged (optional)
+    if n_rows % block_size != 0:
+        permuted = np.concatenate([permuted, X[n_blocks * block_size:]], axis=0)
+
+    return permuted
+
+def compare_smoothness_to_null(data: np.ndarray, null_dist_size: int = 1000):
+    # assume data is NxD where N is the number of samples
+    obs_grad_median, obs_grad_2_median = calc_smoothness(data)
+
+    perm_grad_medians = []
+    perm_grad_2_medians = []
+    for i in range(null_dist_size):
+        perm_data = block_permute_rows(data, 10)#data[np.random.permutation(data.shape[0]),:]
+        perm_grad_median, perm_grad_2_median = calc_smoothness(perm_data)
+        perm_grad_medians.append(perm_grad_median)
+        perm_grad_2_medians.append(perm_grad_2_median)
+
+    perm_grad_medians = np.array(perm_grad_medians)
+    perm_grad_2_medians = np.array(perm_grad_2_medians)
+
+    z_score_smooth = (obs_grad_median - np.mean(perm_grad_medians)) / np.std(perm_grad_medians)
+    z_score_linear = (obs_grad_2_median - np.mean(perm_grad_2_medians)) / np.std(perm_grad_2_medians)
+    return obs_grad_2_median, obs_grad_2_median, z_score_smooth, z_score_linear
+
+def calc_path_efficiency(data: np.ndarray):
+    diff = np.diff(data, axis=0)
+    grad_norm = np.linalg.norm(diff, ord=2, axis=1)
+    denom = np.sum(grad_norm)
+    nom = np.linalg.norm(data[-1,:] - data[0,:], ord=2)
+    return nom/denom
+
+def calc_smt_on_corpus(directory: Path, patch_length: int):
+    audio_files = list_audio_files(directory)
+
+    # extract audio features
+    audio_features = extract_features_from_files(audio_files)
+
+    # this is kinda stupid, just do this in the previous function
+    mels = [clip["mel_spectrogram"] for _, clip in audio_features.items()]
+    mfccs = [clip["mfcc"] for _, clip in audio_features.items()]
+    log_mels = [clip["log_mel_db"] for _, clip in audio_features.items()]
+    hop_length = [clip["hop_length"] for _, clip in audio_features.items()][0]
+    sr = [clip["sr"] for _, clip in audio_features.items()][0]
+
+    # patch and preprocess
+    patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
+    norm_patches, mean, zcaMatrix = preprocess_patches(patches)
+
+    # kmeans for sparse coding
+    kmeans = apply_kmeans_to_patches(norm_patches, 2000, sample_size=None)
+
+    # spectral decomposition for manifold learning
+    labels = kmeans.labels_
+    n_clusters = kmeans.n_clusters 
+    eigvals, eigvecs = spectral_decomp(labels, utterance_bounds, n_clusters)
+
+    # take smallest d eigenvectors as P
+    d = 128  # embedding dimension
+    P = eigvecs[:, 1:d+1].T
+
+    n_samples = labels.shape[0]
+
+    # Sparse cluster code: shape (n_samples, n_clusters)
+    A = csr_matrix(
+        (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
+        shape=(n_samples, n_clusters),
+    )
+
+    A = A.T
+
+    # "sense" the manifold with P
+    beta = P@A
+
+    norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
+    return norm_beta
+
+
