@@ -14,6 +14,8 @@ from tqdm import tqdm
 from scipy.sparse import csr_matrix
 from scipy.linalg import eigh
 
+import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import wilcoxon
@@ -211,8 +213,8 @@ def preprocess_patches(patches: np.ndarray):
     #pca = PCA(whiten=True)
     #patch_vectors = pca.fit_transform(patch_vectors)   
     zcaMatrix = zca_whitening_matrix(patches.T)
-    patches = np.dot(zcaMatrix, patches.T) # project X onto the ZCAMatrix
-    patches = patches.T
+    # patches = np.dot(zcaMatrix, patches.T) # project X onto the ZCAMatrix
+    # patches = patches.T
 
     # normalize patches
     patches = normalize(patches, norm='l2')
@@ -243,42 +245,84 @@ def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
     kmeans.fit(patches)
     return kmeans
 
-def spectral_decomp(labels: np.ndarray, utterance_bounds: list, n_clusters: int):
+def spectral_decomp(
+    labels: np.ndarray | torch.Tensor,
+    utterance_bounds: list,
+    n_clusters: int,
+    device: torch.device | str | None = None,
+    eps: float = 1e-6,
+):
     """
-    we are solving a generalized eigen value decomposition problem: Mu=λVu
-    where: 
-    M=ADD^TA^T (slowness matrix)
-    V=(1/N)A^TA+εI (whitening / covariance constraint)
+    Generalized eigen-decomposition for slow feature transform:
+        M u = λ V u
+    where
+        M = A D D^T A^T (slowness)
+        V = (1/N) A A^T + ε I (covariance regularized)
 
-    to avoid gigantic matrices we calculate M by formulating D as a 1D laplacian and summing over the edges of the chain
+    labels can be np.ndarray or torch.Tensor (1D ints in [0,n_clusters)).
+    utterance_bounds is list of (start,end) boundaries (inclusive start, exclusive end).
+
+    Returns: eigvals, eigvecs as torch tensors (on `device`).
     """
-    
-    n_samples = labels.shape[0]
 
-    # Sparse cluster code: shape (n_samples, n_clusters)
-    A = csr_matrix(
-        (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
-        shape=(n_samples, n_clusters),
-    )
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
 
-    # M = A@D@D.T@A.T
-    M = np.zeros((A.shape[1], A.shape[1]))
-    for (start, end) in tqdm(utterance_bounds, desc="spectral decomp", leave=False):
-        for j in range(start, end - 1):
-            if j+1 < A.shape[0]:
-                diff = (A[j+1] - A[j]).T
-                M += diff@(diff.T)
-    
-    A = A.T # transpose A to match smt formulation
+    if isinstance(labels, np.ndarray):
+        labels_tensor = torch.from_numpy(labels.astype(np.int64))
+    elif isinstance(labels, torch.Tensor):
+        labels_tensor = labels.to(dtype=torch.int64)
+    else:
+        raise TypeError("labels must be numpy array or torch tensor")
 
-    # calculate the constraint
-    n_samples = A.shape[1]
-    eps = 1e-6
-    V = (A @ A.T) / n_samples
-    V += eps * np.eye(V.shape[0]) # regularization which is probably necessary for 1-sparse codes
+    labels_tensor = labels_tensor.to(device=device)
+    n_samples = labels_tensor.shape[0]
 
-    # solve the spectral decomposition
-    eigvals, eigvecs = eigh(M, V)
+    if n_samples == 0:
+        raise ValueError("labels must be non-empty")
+
+    # accumulate transitions over utterances
+    edges_src = []
+    edges_dst = []
+
+    for start, end in utterance_bounds:
+        if end <= start + 1:
+            continue
+        seg = labels_tensor[start:end]
+        edges_src.append(seg[:-1])
+        edges_dst.append(seg[1:])
+
+    if len(edges_src) == 0:
+        raise ValueError("No valid utterance edges found in utterance_bounds")
+
+    src = torch.cat(edges_src, dim=0)
+    dst = torch.cat(edges_dst, dim=0)
+
+    # Diagonal contribution
+    count_src = torch.bincount(src, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    count_dst = torch.bincount(dst, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    M = torch.diag(count_src + count_dst)
+
+    # Off-diagonals from transitions
+    src_onehot = F.one_hot(src, num_classes=n_clusters).to(dtype=torch.float32, device=device)
+    dst_onehot = F.one_hot(dst, num_classes=n_clusters).to(dtype=torch.float32, device=device)
+    cross = dst_onehot.T @ src_onehot + src_onehot.T @ dst_onehot
+    M = M - cross
+
+    # V matrix is diagonal for one-hot codes
+    cluster_counts = torch.bincount(labels_tensor, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    V_diag = cluster_counts / n_samples + eps
+
+    inv_sqrt = torch.diag(1.0 / torch.sqrt(V_diag))
+
+    # transform to standard eig problem: inv_sqrt * M * inv_sqrt
+    M_whitened = inv_sqrt @ M @ inv_sqrt
+
+    eigvals, eigvecs_w = torch.linalg.eigh(M_whitened)
+    eigvecs = inv_sqrt @ eigvecs_w
+
     return eigvals, eigvecs
 
 def plot_first_n_mel_patches(mel_patches, n_show=10, cols=5, cmap='magma'):
@@ -492,7 +536,7 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
         shape=(n_samples, n_clusters),
     )
 
-    A = A.T
+    A = torch.tensor(A.T)
 
     # "sense" the manifold with P
     beta = P@A
@@ -500,9 +544,12 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
     norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
     return norm_beta, norm_patches, utterance_bounds
 
-def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances =  100, d: int = 128):
-    
-    print("calc mels")
+def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances =  100, d: int = 128, device: torch.device | str | None = None,):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+    print("calc log mels")
     audio_features = extract_features_from_dataset(librispeech_ds, num_utterances)
 
     # this is kinda stupid, just do this in the previous function
@@ -514,7 +561,7 @@ def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances = 
 
     # patch and preprocess
     print("patch utterances")
-    patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
+    patches, utterance_bounds = patch_multiple_utterances(log_mels, sr, hop_length, patch_length)
     norm_patches, mean, zcaMatrix = preprocess_patches(patches)
 
     # kmeans for sparse coding
@@ -539,9 +586,12 @@ def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances = 
     )
 
     A = A.T
+    A = A.todense()
+    A = torch.from_numpy(A).to(dtype=torch.float32, device=device)
 
     # "sense" the manifold with P
     beta = P@A
+    beta = beta.cpu().numpy()
 
     norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
     return kmeans, norm_beta, norm_patches, utterance_bounds
