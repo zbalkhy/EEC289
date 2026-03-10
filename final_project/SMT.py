@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable
+from itertools import product
 
 import librosa
 import numpy as np
@@ -19,7 +20,9 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import wilcoxon
+from FISTA import TopKSparseCoder
 
+import torch
 
 def extract_mel_and_mfcc(
     audio_path: str | Path,
@@ -660,4 +663,175 @@ def plot_paired_comparison(metric_mel, metric_smt, patch_length, metric_name="Cu
     plt.show()
     return stat, p, med_diff, (ci_lo, ci_hi)
 
+def spectral_decomp_dense_torch(
+    A: torch.Tensor,
+    utterance_bounds,
+    eps: float = 1e-6,
+):
+    """
+    A: (N, n_clusters) dense tensor
+    """
+    A = A.float()
+    N, n_clusters = A.shape
 
+    M = torch.zeros((n_clusters, n_clusters), device=A.device, dtype=A.dtype)
+
+    for start, end in utterance_bounds:
+        if end - start < 2:
+            continue
+        D = A[start + 1:end] - A[start:end - 1]   # (T-1, n_clusters)
+        M += D.T @ D
+
+    V = (A.T @ A) / N
+    V += eps * torch.eye(n_clusters, device=A.device, dtype=A.dtype)
+
+    L = torch.linalg.cholesky(V)
+    Linv_M = torch.linalg.solve_triangular(L, M, upper=False, left=True)
+    C = torch.linalg.solve_triangular(
+        L, Linv_M.transpose(-1, -2), upper=False, left=True
+    ).transpose(-1, -2)
+    C = 0.5 * (C + C.T)
+
+    eigvals, y = torch.linalg.eigh(C)
+    eigvecs = torch.linalg.solve_triangular(L.T, y, upper=True, left=True)
+
+    return eigvals, eigvecs
+
+def calc_smt_on_librispeech_k_sparse(
+        librispeech_ds,
+        k_sparse: int, 
+        patch_length: int,
+        n_mels: int,
+        window_ms: int,
+        hop_length: int,
+        num_clusters: int,
+        num_utterances: int = 100,
+        d: int = 128
+):
+    audio_features = extract_features_from_dataset(librispeech_ds, 
+                                                   num_utterances, 
+                                                   n_mels,
+                                                   window_ms=window_ms, hop_ms=hop_length)
+
+    # this is kinda stupid, just do this in the previous function
+    mels = [clip["mel_spectrogram"] for _, clip in audio_features.items()]
+    mfccs = [clip["mfcc"] for _, clip in audio_features.items()]
+    log_mels = [clip["log_mel_db"] for _, clip in audio_features.items()]
+    hop_length = [clip["hop_length"] for _, clip in audio_features.items()][0]
+    sr = [clip["sr"] for _, clip in audio_features.items()][0]
+
+    # patch and preprocess
+    print("patch utterances")
+    patches, utterance_bounds = patch_multiple_utterances(log_mels, sr, hop_length, patch_length)
+    norm_patches, mean, zcaMatrix = preprocess_patches(patches)
+
+    # kmeans for sparse coding
+    print("apply kmeans")
+    kmeans = apply_kmeans_to_patches(norm_patches, num_clusters, sample_size=None)
+
+    # k-sparse coding
+    print("sparse coding")
+    k_sparse_coder = TopKSparseCoder(torch.tensor(kmeans.cluster_centers_).to(dtype=torch.float32), k_sparse, 100, True, True)
+    sparse_codes = k_sparse_coder(torch.tensor(norm_patches).to(dtype=torch.float32))
+
+    print("spectral decomp")
+    eigvals, eigvecs = spectral_decomp_dense_torch(sparse_codes, utterance_bounds)
+
+    # take smallest d eigenvectors as P
+    P = eigvecs[:, 1:d+1].T
+
+    beta = P@sparse_codes.T
+    print("norm smt patches")
+    norm_beta, _, _ = preprocess_patches(beta.T.numpy()) # this switches beta to be NxD like norm_patches
+    norm_beta = norm_beta
+
+    return {
+        "kmeans": kmeans,
+        "sparse_codes": sparse_codes,
+        "norm_smt": norm_beta,
+        "norm_mel": norm_patches,
+        "utterance_bounds": utterance_bounds,
+    }
+
+def grid_search(
+    librispeech_ds,
+    k_values: list[int] | None = None,
+    patch_lengths: list[int] | None = None,
+    n_mels_values: list[int] | None = None,
+    num_clusters_values: list[int] | None = None,
+    window_ms: int = 20,
+    hop_ms: int = 10,
+    num_utterances: int = 100,
+    d: int = 128,
+    compute_metrics: bool = True,
+):
+    """
+    Run SMT k-sparse pipeline for every hyperparameter combination.
+
+    Returns:
+        dict with:
+            - results: list of per-config dicts
+            - errors: list of per-config failures
+            - searched: total number of configs attempted
+    """
+    if k_values is None:
+        k_values = [1, 5, 10]
+    if patch_lengths is None:
+        patch_lengths = [20, 50, 80, 100, 200, 300]
+    if n_mels_values is None:
+        n_mels_values = [10, 20, 40]
+    if num_clusters_values is None:
+        num_clusters_values = [2000, 4000, 6000]
+
+    configs = list(product(k_values, patch_lengths, n_mels_values, num_clusters_values))
+    results = []
+    errors = []
+
+    for k_sparse, patch_length, n_mels, num_clusters in tqdm(configs, desc="grid_search"):
+        cfg = {
+            "k_sparse": k_sparse,
+            "patch_length": patch_length,
+            "n_mels": n_mels,
+            "num_clusters": num_clusters,
+            "window_ms": window_ms,
+            "hop_ms": hop_ms,
+            "num_utterances": num_utterances,
+            "d": d,
+        }
+
+        try:
+            out = calc_smt_on_librispeech_k_sparse(
+                librispeech_ds=librispeech_ds,
+                k_sparse=k_sparse,
+                patch_length=patch_length,
+                n_mels=n_mels,
+                window_ms=window_ms,
+                hop_length=hop_ms,
+                num_clusters=num_clusters,
+                num_utterances=num_utterances,
+                d=d,
+            )
+
+            entry = {"config": cfg}
+            if compute_metrics:
+                smt_stats, mel_stats = calc_metrics_per_utterance(
+                    out["norm_mel"],
+                    out["norm_smt"],
+                    out["utterance_bounds"],
+                )
+                entry["smt_stats"] = smt_stats
+                entry["mel_stats"] = mel_stats
+            else:
+                # Keep only compact outputs by default; avoid storing large models/tensors.
+                entry["n_samples"] = int(out["norm_smt"].shape[0])
+                entry["feature_dim"] = int(out["norm_smt"].shape[1])
+
+            results.append(entry)
+        except Exception as exc:
+            errors.append({"config": cfg, "error_type": type(exc).__name__, "error": str(exc)})
+
+    return {
+        "results": results,
+        "errors": errors,
+        "searched": len(configs),
+    }
