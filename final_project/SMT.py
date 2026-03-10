@@ -456,7 +456,7 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
     audio_files = list_audio_files(directory)
 
     # extract audio features
-    print("calc mels")
+    print("calc log mels")
     audio_features = extract_features_from_files(audio_files)
 
     # this is kinda stupid, just do this in the previous function
@@ -468,7 +468,7 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
 
     # patch and preprocess
     print("patch utterances")
-    patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
+    patches, utterance_bounds = patch_multiple_utterances(log_mels, sr, hop_length, patch_length)
     norm_patches, mean, zcaMatrix = preprocess_patches(patches)
 
     # kmeans for sparse coding
