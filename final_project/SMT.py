@@ -14,6 +14,10 @@ from tqdm import tqdm
 from scipy.sparse import csr_matrix
 from scipy.linalg import eigh
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import wilcoxon
+
 
 def extract_mel_and_mfcc(
     audio_path: str | Path,
@@ -85,6 +89,53 @@ def extract_features_from_files(
             window_ms=window_ms,
             hop_ms=hop_ms,
         )
+    return results
+
+def extract_features_from_dataset(
+    ds,
+    n_samples = 100,
+    n_mels: int = 40,
+    n_mfcc: int = 20,
+    window_ms: float = 20.0,
+    hop_ms: float = 10.0,
+) -> dict[str, dict[str, np.ndarray | int]]:
+    """Extract mel-spectrogram and MFCC for multiple audio files."""
+    results: dict[str, dict[str, np.ndarray | int]] = {}
+    for i, sample in enumerate(ds):
+        if i >= n_samples:
+            break
+        y = sample[0].numpy()
+        sr = sample[1]
+        win_length = max(1, int(round(sr * (window_ms / 1000.0))))
+        hop_length = max(1, int(round(sr * (hop_ms / 1000.0))))
+        n_fft = win_length
+
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=y,
+            sr=sr,
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            center=True,
+            power=2.0,
+        )
+
+        log_mel_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+
+        mfcc = librosa.feature.mfcc(
+            S=log_mel_db,
+            n_mfcc=n_mfcc,
+        )
+
+        results[str(sample[3]) + "_" + str(sample[4]) + "_" + str(sample[5])] =  {
+            "sr": sr,
+            "win_length": win_length,
+            "hop_length": hop_length,
+            "mel_spectrogram": mel_spectrogram.squeeze(),
+            "log_mel_db": log_mel_db.squeeze(),
+            "mfcc": mfcc,
+        }
     return results
 
 def extract_time_patches(
@@ -212,8 +263,8 @@ def spectral_decomp(labels: np.ndarray, utterance_bounds: list, n_clusters: int)
 
     # M = A@D@D.T@A.T
     M = np.zeros((A.shape[1], A.shape[1]))
-    for (start, end) in utterance_bounds:
-        for j in tqdm(range(start, end - 1), leave=False):
+    for (start, end) in tqdm(utterance_bounds, desc="spectral decomp", leave=False):
+        for j in range(start, end - 1):
             if j+1 < A.shape[0]:
                 diff = (A[j+1] - A[j]).T
                 M += diff@(diff.T)
@@ -366,10 +417,46 @@ def calc_path_efficiency(data: np.ndarray):
     nom = np.linalg.norm(data[-1,:] - data[0,:], ord=2)
     return nom/denom
 
-def calc_smt_on_corpus(directory: Path, patch_length: int):
+def calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds):
+    smt_stats = {'obs_grad_median': [], 
+             'obs_grad_2_median': [],
+             'z_score_smooth': [],
+             'z_score_linear': [],
+             'path_efficiency': []}
+    mel_stats = {'obs_grad_median': [], 
+                'obs_grad_2_median': [],
+                'z_score_smooth': [],
+                'z_score_linear': [],
+                'path_efficiency': []}
+    for (start, end) in tqdm(utterance_bounds, desc="metrics", leave=False):
+        sample_utterance_mel = mel_patches[start:end,:]
+        sample_utterance_beta = smt_patches[start:end,:]
+
+        # calc smoothness on sensed manifold and plot
+        obs_grad_median_beta, obs_grad_2_median_beta, z_score_smooth_beta, z_score_linear_beta = compare_smoothness_to_null(sample_utterance_beta)
+        path_efficiency = calc_path_efficiency(sample_utterance_beta)
+        
+        smt_stats['path_efficiency'].append(path_efficiency)
+        smt_stats['obs_grad_median'].append(obs_grad_median_beta)
+        smt_stats['obs_grad_2_median'].append(obs_grad_2_median_beta)
+        smt_stats['z_score_smooth'].append(z_score_smooth_beta)
+        smt_stats['z_score_linear'].append(z_score_linear_beta)
+        
+        obs_grad_median_mel, obs_grad_2_median_mel, z_score_smooth_mel, z_score_linear_mel = compare_smoothness_to_null(sample_utterance_mel)
+        path_efficiency = calc_path_efficiency(sample_utterance_mel)
+
+        mel_stats['path_efficiency'].append(path_efficiency)
+        mel_stats['obs_grad_median'].append(obs_grad_median_mel)
+        mel_stats['obs_grad_2_median'].append(obs_grad_2_median_mel)
+        mel_stats['z_score_smooth'].append(z_score_smooth_mel)
+        mel_stats['z_score_linear'].append(z_score_linear_mel)
+    return smt_stats, mel_stats
+
+def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
     audio_files = list_audio_files(directory)
 
     # extract audio features
+    print("calc mels")
     audio_features = extract_features_from_files(audio_files)
 
     # this is kinda stupid, just do this in the previous function
@@ -380,19 +467,21 @@ def calc_smt_on_corpus(directory: Path, patch_length: int):
     sr = [clip["sr"] for _, clip in audio_features.items()][0]
 
     # patch and preprocess
+    print("patch utterances")
     patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
     norm_patches, mean, zcaMatrix = preprocess_patches(patches)
 
     # kmeans for sparse coding
+    print("apply kmeans")
     kmeans = apply_kmeans_to_patches(norm_patches, 2000, sample_size=None)
 
     # spectral decomposition for manifold learning
     labels = kmeans.labels_
     n_clusters = kmeans.n_clusters 
+    print("spectral decomp")
     eigvals, eigvecs = spectral_decomp(labels, utterance_bounds, n_clusters)
 
     # take smallest d eigenvectors as P
-    d = 128  # embedding dimension
     P = eigvecs[:, 1:d+1].T
 
     n_samples = labels.shape[0]
@@ -409,6 +498,116 @@ def calc_smt_on_corpus(directory: Path, patch_length: int):
     beta = P@A
 
     norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
-    return norm_beta
+    return norm_beta, norm_patches, utterance_bounds
+
+def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances =  100, d: int = 128):
+    
+    print("calc mels")
+    audio_features = extract_features_from_dataset(librispeech_ds, num_utterances)
+
+    # this is kinda stupid, just do this in the previous function
+    mels = [clip["mel_spectrogram"] for _, clip in audio_features.items()]
+    mfccs = [clip["mfcc"] for _, clip in audio_features.items()]
+    log_mels = [clip["log_mel_db"] for _, clip in audio_features.items()]
+    hop_length = [clip["hop_length"] for _, clip in audio_features.items()][0]
+    sr = [clip["sr"] for _, clip in audio_features.items()][0]
+
+    # patch and preprocess
+    print("patch utterances")
+    patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
+    norm_patches, mean, zcaMatrix = preprocess_patches(patches)
+
+    # kmeans for sparse coding
+    print("apply kmeans")
+    kmeans = apply_kmeans_to_patches(norm_patches, 2000, sample_size=None)
+
+    # spectral decomposition for manifold learning
+    labels = kmeans.labels_
+    n_clusters = kmeans.n_clusters 
+    print("spectral decomp")
+    eigvals, eigvecs = spectral_decomp(labels, utterance_bounds, n_clusters)
+
+    # take smallest d eigenvectors as P
+    P = eigvecs[:, 1:d+1].T
+
+    n_samples = labels.shape[0]
+
+    # Sparse cluster code: shape (n_samples, n_clusters)
+    A = csr_matrix(
+        (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
+        shape=(n_samples, n_clusters),
+    )
+
+    A = A.T
+
+    # "sense" the manifold with P
+    beta = P@A
+
+    norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
+    return kmeans, norm_beta, norm_patches, utterance_bounds
+
+def grid_search_patch_size_smt(directory: Path, patch_lengths: list[int], d: int = 128):
+    results = {}
+    for i in tqdm(patch_lengths, desc="smt_per_patch_length"):
+        print("start smt on patch_size: {}".format(i))
+        smt_patches, mel_patches, utterance_bounds = calc_smt_on_corpus(directory, i, d)
+        smt_stats, mel_stats = calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds)
+        results[i] = {"mel_stats": mel_stats, "smt_stats": smt_stats}
+    return results
+
+def paired_bootstrap_ci(diffs, n_boot=5000, alpha=0.05, rng=None):
+    rng = np.random.default_rng(rng)
+    diffs = np.asarray(diffs)
+    boots = []
+    n = len(diffs)
+    for _ in range(n_boot):
+        sample = rng.choice(diffs, size=n, replace=True)
+        boots.append(np.median(sample))
+    lo = np.percentile(boots, 100 * (alpha / 2))
+    hi = np.percentile(boots, 100 * (1 - alpha / 2))
+    return np.median(diffs), lo, hi
+
+def plot_paired_comparison(metric_mel, metric_smt, patch_length, metric_name="Curvature z-score", alternative="less"):
+    metric_mel = np.asarray(metric_mel)
+    metric_smt = np.asarray(metric_smt)
+    diffs = metric_smt - metric_mel
+
+    stat, p = wilcoxon(metric_smt, metric_mel, alternative=alternative)
+
+    med_diff, ci_lo, ci_hi = paired_bootstrap_ci(diffs, rng=0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
+
+    fig.suptitle("patch_length={}ms".format(patch_length))
+    # Left: paired slope plot
+    x0, x1 = 0, 1
+    for a, b in zip(metric_mel, metric_smt):
+        axes[0].plot([x0, x1], [a, b], alpha=0.35)
+    axes[0].scatter(np.full_like(metric_mel, x0), metric_mel, s=20)
+    axes[0].scatter(np.full_like(metric_smt, x1), metric_smt, s=20)
+    axes[0].set_xticks([0, 1])
+    axes[0].set_xticklabels(["Mel", "SMT"])
+    axes[0].set_ylabel(metric_name)
+    axes[0].set_title("Per-utterance paired values")
+
+    # Right: paired differences
+    jitter = np.random.default_rng(0).normal(0, 0.04, size=len(diffs))
+    axes[1].scatter(jitter, diffs, alpha=0.5, s=20)
+    axes[1].axhline(0, linestyle="--", linewidth=1)
+    axes[1].errorbar(
+        0.22, med_diff,
+        yerr=[[med_diff - ci_lo], [ci_hi - med_diff]],
+        fmt="o", capsize=4
+    )
+    axes[1].set_xlim(-0.15, 0.45)
+    axes[1].set_xticks([])
+    axes[1].set_ylabel("SMT - Mel")
+    axes[1].set_title(
+        f"Paired differences\nmedian={med_diff:.3f}, 95% CI [{ci_lo:.3f}, {ci_hi:.3f}]\n"
+        f"Wilcoxon p={p:.3g}"
+    )
+
+    plt.show()
+    return stat, p, med_diff, (ci_lo, ci_hi)
 
 
