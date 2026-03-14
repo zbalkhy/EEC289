@@ -15,10 +15,15 @@ from tqdm import tqdm
 from scipy.sparse import csr_matrix
 from scipy.linalg import eigh
 
+import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import wilcoxon
 from FISTA import TopKSparseCoder
+from kmeans import *
+from typing import List, Tuple
+
 
 import torch
 
@@ -94,6 +99,67 @@ def extract_features_from_files(
         )
     return results
 
+def trim_silence(
+    audio: np.ndarray,
+    sr: int,
+    frame_ms: float = 20.0,
+    hop_ms: float = 10.0,
+    energy_threshold: float = 0.01,
+):
+    """
+    Trim silence from beginning and end of an audio signal using RMS energy.
+
+    Parameters
+    ----------
+    audio : np.ndarray
+        1D waveform
+    sr : int
+        sample rate
+    frame_ms : float
+        analysis frame size in milliseconds
+    hop_ms : float
+        hop size in milliseconds
+    energy_threshold : float
+        normalized RMS threshold for detecting speech
+
+    Returns
+    -------
+    trimmed_audio : np.ndarray
+    start_sample : int
+    end_sample : int
+    """
+
+    frame = int(sr * frame_ms / 1000)
+    hop = int(sr * hop_ms / 1000)
+
+    # frame the audio
+    n_frames = 1 + (len(audio) - frame) // hop
+    frames = np.lib.stride_tricks.as_strided(
+        audio,
+        shape=(n_frames, frame),
+        strides=(audio.strides[0] * hop, audio.strides[0]),
+    )
+
+    # compute RMS energy
+    rms = np.sqrt(np.mean(frames**2, axis=1))
+
+    # normalize energy
+    rms /= (np.max(rms) + 1e-10)
+
+    # find active frames
+    active = np.where(rms > energy_threshold)[0]
+
+    if len(active) == 0:
+        return audio, 0, len(audio)
+
+    start_frame = active[0]
+    end_frame = active[-1]
+
+    start_sample = start_frame * hop
+    end_sample = min(len(audio), end_frame * hop + frame)
+
+    return audio[start_sample:end_sample], start_sample, end_sample
+
 def extract_features_from_dataset(
     ds,
     n_samples = 100,
@@ -109,12 +175,13 @@ def extract_features_from_dataset(
             break
         y = sample[0].numpy()
         sr = sample[1]
+        trimmed, _, _ = trim_silence(y.squeeze(), sr=sr)
         win_length = max(1, int(round(sr * (window_ms / 1000.0))))
         hop_length = max(1, int(round(sr * (hop_ms / 1000.0))))
         n_fft = win_length
 
         mel_spectrogram = librosa.feature.melspectrogram(
-            y=y,
+            y=trimmed,
             sr=sr,
             n_fft=n_fft,
             win_length=win_length,
@@ -246,42 +313,84 @@ def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
     kmeans.fit(patches)
     return kmeans
 
-def spectral_decomp(labels: np.ndarray, utterance_bounds: list, n_clusters: int):
+def spectral_decomp(
+    labels: np.ndarray | torch.Tensor,
+    utterance_bounds: list,
+    n_clusters: int,
+    device: torch.device | str | None = None,
+    eps: float = 1e-6,
+):
     """
-    we are solving a generalized eigen value decomposition problem: Mu=λVu
-    where: 
-    M=ADD^TA^T (slowness matrix)
-    V=(1/N)A^TA+εI (whitening / covariance constraint)
+    Generalized eigen-decomposition for slow feature transform:
+        M u = λ V u
+    where
+        M = A D D^T A^T (slowness)
+        V = (1/N) A A^T + ε I (covariance regularized)
 
-    to avoid gigantic matrices we calculate M by formulating D as a 1D laplacian and summing over the edges of the chain
+    labels can be np.ndarray or torch.Tensor (1D ints in [0,n_clusters)).
+    utterance_bounds is list of (start,end) boundaries (inclusive start, exclusive end).
+
+    Returns: eigvals, eigvecs as torch tensors (on `device`).
     """
-    
-    n_samples = labels.shape[0]
 
-    # Sparse cluster code: shape (n_samples, n_clusters)
-    A = csr_matrix(
-        (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
-        shape=(n_samples, n_clusters),
-    )
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
 
-    # M = A@D@D.T@A.T
-    M = np.zeros((A.shape[1], A.shape[1]))
-    for (start, end) in tqdm(utterance_bounds, desc="spectral decomp", leave=False):
-        for j in range(start, end - 1):
-            if j+1 < A.shape[0]:
-                diff = (A[j+1] - A[j]).T
-                M += diff@(diff.T)
-    
-    A = A.T # transpose A to match smt formulation
+    if isinstance(labels, np.ndarray):
+        labels_tensor = torch.from_numpy(labels.astype(np.int64))
+    elif isinstance(labels, torch.Tensor):
+        labels_tensor = labels.to(dtype=torch.int64)
+    else:
+        raise TypeError("labels must be numpy array or torch tensor")
 
-    # calculate the constraint
-    n_samples = A.shape[1]
-    eps = 1e-6
-    V = (A @ A.T) / n_samples
-    V += eps * np.eye(V.shape[0]) # regularization which is probably necessary for 1-sparse codes
+    labels_tensor = labels_tensor.to(device=device)
+    n_samples = labels_tensor.shape[0]
 
-    # solve the spectral decomposition
-    eigvals, eigvecs = eigh(M, V)
+    if n_samples == 0:
+        raise ValueError("labels must be non-empty")
+
+    # accumulate transitions over utterances
+    edges_src = []
+    edges_dst = []
+
+    for start, end in utterance_bounds:
+        if end <= start + 1:
+            continue
+        seg = labels_tensor[start:end]
+        edges_src.append(seg[:-1])
+        edges_dst.append(seg[1:])
+
+    if len(edges_src) == 0:
+        raise ValueError("No valid utterance edges found in utterance_bounds")
+
+    src = torch.cat(edges_src, dim=0)
+    dst = torch.cat(edges_dst, dim=0)
+
+    # Diagonal contribution
+    count_src = torch.bincount(src, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    count_dst = torch.bincount(dst, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    M = torch.diag(count_src + count_dst)
+
+    # Off-diagonals from transitions
+    src_onehot = F.one_hot(src, num_classes=n_clusters).to(dtype=torch.float32, device=device)
+    dst_onehot = F.one_hot(dst, num_classes=n_clusters).to(dtype=torch.float32, device=device)
+    cross = dst_onehot.T @ src_onehot + src_onehot.T @ dst_onehot
+    M = M - cross
+
+    # V matrix is diagonal for one-hot codes
+    cluster_counts = torch.bincount(labels_tensor, minlength=n_clusters).to(dtype=torch.float32, device=device)
+    V_diag = cluster_counts / n_samples + eps
+
+    inv_sqrt = torch.diag(1.0 / torch.sqrt(V_diag))
+
+    # transform to standard eig problem: inv_sqrt * M * inv_sqrt
+    M_whitened = inv_sqrt @ M @ inv_sqrt
+
+    eigvals, eigvecs_w = torch.linalg.eigh(M_whitened)
+    eigvecs = inv_sqrt @ eigvecs_w
+
     return eigvals, eigvecs
 
 def plot_first_n_mel_patches(mel_patches, n_show=10, cols=5, cmap='magma'):
@@ -321,7 +430,7 @@ def plot_first_n_mel_patches(mel_patches, n_show=10, cols=5, cmap='magma'):
     fig.suptitle(f'First {n_show} Mel-Spectrogram Patches')
     plt.show()
 
-def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_length=300):
+def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_length=300, patch_frame_hop=1):
     patches = []
     utterance_bounds = []
     start = 0
@@ -331,7 +440,7 @@ def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_leng
             sr=sr,
             hop_length=hop_length,
             patch_ms=patch_length,
-            patch_hop_frames=1,
+            patch_hop_frames=patch_frame_hop,
         )
         end = start + p.shape[0]
         patches.append(p)
@@ -394,14 +503,14 @@ def block_permute_rows(X, block_size, rng=None):
 
     return permuted
 
-def compare_smoothness_to_null(data: np.ndarray, null_dist_size: int = 1000):
+def compare_smoothness_to_null(data: np.ndarray, null_dist_size: int = 1000, block_size: int = 10):
     # assume data is NxD where N is the number of samples
     obs_grad_median, obs_grad_2_median = calc_smoothness(data)
 
     perm_grad_medians = []
     perm_grad_2_medians = []
     for i in range(null_dist_size):
-        perm_data = block_permute_rows(data, 10)#data[np.random.permutation(data.shape[0]),:]
+        perm_data = block_permute_rows(data, block_size)#data[np.random.permutation(data.shape[0]),:]
         perm_grad_median, perm_grad_2_median = calc_smoothness(perm_data)
         perm_grad_medians.append(perm_grad_median)
         perm_grad_2_medians.append(perm_grad_2_median)
@@ -420,7 +529,7 @@ def calc_path_efficiency(data: np.ndarray):
     nom = np.linalg.norm(data[-1,:] - data[0,:], ord=2)
     return nom/denom
 
-def calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds):
+def calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds, block_size: 10):
     smt_stats = {'obs_grad_median': [], 
              'obs_grad_2_median': [],
              'z_score_smooth': [],
@@ -436,7 +545,7 @@ def calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds):
         sample_utterance_beta = smt_patches[start:end,:]
 
         # calc smoothness on sensed manifold and plot
-        obs_grad_median_beta, obs_grad_2_median_beta, z_score_smooth_beta, z_score_linear_beta = compare_smoothness_to_null(sample_utterance_beta)
+        obs_grad_median_beta, obs_grad_2_median_beta, z_score_smooth_beta, z_score_linear_beta = compare_smoothness_to_null(sample_utterance_beta, block_size)
         path_efficiency = calc_path_efficiency(sample_utterance_beta)
         
         smt_stats['path_efficiency'].append(path_efficiency)
@@ -445,7 +554,7 @@ def calc_metrics_per_utterance(mel_patches, smt_patches, utterance_bounds):
         smt_stats['z_score_smooth'].append(z_score_smooth_beta)
         smt_stats['z_score_linear'].append(z_score_linear_beta)
         
-        obs_grad_median_mel, obs_grad_2_median_mel, z_score_smooth_mel, z_score_linear_mel = compare_smoothness_to_null(sample_utterance_mel)
+        obs_grad_median_mel, obs_grad_2_median_mel, z_score_smooth_mel, z_score_linear_mel = compare_smoothness_to_null(sample_utterance_mel, block_size)
         path_efficiency = calc_path_efficiency(sample_utterance_mel)
 
         mel_stats['path_efficiency'].append(path_efficiency)
@@ -495,7 +604,7 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
         shape=(n_samples, n_clusters),
     )
 
-    A = A.T
+    A = torch.tensor(A.T)
 
     # "sense" the manifold with P
     beta = P@A
@@ -503,9 +612,12 @@ def calc_smt_on_corpus(directory: Path, patch_length: int, d: int = 128):
     norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
     return norm_beta, norm_patches, utterance_bounds
 
-def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances =  100, d: int = 128):
-    
-    print("calc mels")
+def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances =  100, d: int = 128, device: torch.device | str | None = None,):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+    print("calc log mels")
     audio_features = extract_features_from_dataset(librispeech_ds, num_utterances)
 
     # this is kinda stupid, just do this in the previous function
@@ -517,7 +629,7 @@ def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances = 
 
     # patch and preprocess
     print("patch utterances")
-    patches, utterance_bounds = patch_multiple_utterances(mels, sr, hop_length, patch_length)
+    patches, utterance_bounds = patch_multiple_utterances(log_mels, sr, hop_length, patch_length)
     norm_patches, mean, zcaMatrix = preprocess_patches(patches)
 
     # kmeans for sparse coding
@@ -542,9 +654,12 @@ def calc_smt_on_librispeech(librispeech_ds, patch_length: int, num_utterances = 
     )
 
     A = A.T
+    A = A.todense()
+    A = torch.from_numpy(A).to(dtype=torch.float32, device=device)
 
     # "sense" the manifold with P
     beta = P@A
+    beta = beta.cpu().numpy()
 
     norm_beta, _, _ = preprocess_patches(beta.T) # this switches beta to be NxD like norm_patches
     return kmeans, norm_beta, norm_patches, utterance_bounds
@@ -581,7 +696,7 @@ def plot_paired_comparison(metric_mel, metric_smt, patch_length, metric_name="Cu
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
 
-    fig.suptitle("patch_length={}ms".format(patch_length))
+    fig.suptitle(metric_name + ", patch_length={}ms".format(patch_length))
     # Left: paired slope plot
     x0, x1 = 0, 1
     for a, b in zip(metric_mel, metric_smt):
@@ -647,6 +762,91 @@ def spectral_decomp_dense_torch(
 
     return eigvals, eigvecs
 
+def spectral_decomp_dense_second_order_torch(
+    A: torch.Tensor,
+    utterance_bounds: List[Tuple[int, int]],
+    eps: float = 1e-6,
+):
+    """
+    Generalized eigendecomposition using second-order temporal differences.
+
+    Solves:
+        M u = λ V u
+
+    where
+        d_t = a_{t+1} - 2 a_t + a_{t-1}
+        M   = sum_t d_t d_t^T
+        V   = (1/N) A^T A + eps I
+
+    Args:
+        A:
+            Dense code matrix of shape (N, n_clusters), where each row is a code a_t.
+        utterance_bounds:
+            List of (start, end) index pairs. Each utterance contributes
+            second-order differences for t = start+1, ..., end-2.
+            `end` is exclusive.
+        eps:
+            Diagonal regularization added to V.
+
+    Returns:
+        eigvals:
+            Tensor of shape (n_clusters,)
+        eigvecs:
+            Tensor of shape (n_clusters, n_clusters)
+    """
+    if A.ndim != 2:
+        raise ValueError("A must have shape (N, n_clusters)")
+
+    A = A.float()
+    N, n_clusters = A.shape
+    device = A.device
+    dtype = A.dtype
+
+    # ------------------------------------------------------------
+    # Build M from second-order temporal differences
+    # ------------------------------------------------------------
+    M = torch.zeros((n_clusters, n_clusters), device=device, dtype=dtype)
+
+    for start, end in utterance_bounds:
+        # Need at least 3 samples to form a_{t+1} - 2a_t + a_{t-1}
+        if end - start < 3:
+            continue
+
+        A_prev = A[start:end - 2]      # a_{t-1}
+        A_curr = A[start + 1:end - 1]  # a_t
+        A_next = A[start + 2:end]      # a_{t+1}
+
+        D2 = A_next - 2.0 * A_curr + A_prev   # (T-2, n_clusters)
+        M += D2.T @ D2
+
+    # ------------------------------------------------------------
+    # Build V = (1/N) A^T A + eps I
+    # ------------------------------------------------------------
+    V = (A.T @ A) / N
+    V += eps * torch.eye(n_clusters, device=device, dtype=dtype)
+
+    # ------------------------------------------------------------
+    # Solve generalized eigenproblem M u = λ V u
+    # via Cholesky reduction
+    # ------------------------------------------------------------
+    L = torch.linalg.cholesky(V)
+
+    # C = L^{-1} M L^{-T}
+    Linv_M = torch.linalg.solve_triangular(L, M, upper=False, left=True)
+    C = torch.linalg.solve_triangular(
+        L, Linv_M.transpose(-1, -2), upper=False, left=True
+    ).transpose(-1, -2)
+
+    # Symmetrize for numerical stability
+    C = 0.5 * (C + C.T)
+
+    eigvals, y = torch.linalg.eigh(C)
+
+    # Recover generalized eigenvectors
+    eigvecs = torch.linalg.solve_triangular(L.T, y, upper=True, left=True)
+
+    return eigvals, eigvecs
+
 def calc_smt_on_librispeech_k_sparse(
         librispeech_ds,
         k_sparse: int, 
@@ -658,6 +858,7 @@ def calc_smt_on_librispeech_k_sparse(
         num_utterances: int = 100,
         d: int = 128
 ):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     audio_features = extract_features_from_dataset(librispeech_ds, 
                                                    num_utterances, 
                                                    n_mels,
@@ -671,32 +872,51 @@ def calc_smt_on_librispeech_k_sparse(
     sr = [clip["sr"] for _, clip in audio_features.items()][0]
 
     # patch and preprocess
-    print("patch utterances")
     patches, utterance_bounds = patch_multiple_utterances(log_mels, sr, hop_length, patch_length)
     norm_patches, mean, zcaMatrix = preprocess_patches(patches)
 
     # kmeans for sparse coding
-    print("apply kmeans")
-    kmeans = apply_kmeans_to_patches(norm_patches, num_clusters, sample_size=None)
+    labels, centroids, inertia = kmeans_gpu(
+        norm_patches,
+        n_clusters=num_clusters,
+        n_iters=100,
+        n_init=10,
+        tol=1e-4,
+        distance="euclidean",
+        batch_size=8192,
+        verbose=True,
+    )
+    #kmeans = apply_kmeans_to_patches(norm_patches, num_clusters, sample_size=None)
 
     # k-sparse coding
-    print("sparse coding")
-    k_sparse_coder = TopKSparseCoder(torch.tensor(kmeans.cluster_centers_).to(dtype=torch.float32), k_sparse, 100, True, True)
-    sparse_codes = k_sparse_coder(torch.tensor(norm_patches).to(dtype=torch.float32))
+    if k_sparse ==1:
+        #labels = kmeans.labels_
+        n_samples = labels.shape[0]
 
-    print("spectral decomp")
+        # Sparse cluster code: shape (n_samples, n_clusters)
+        A = csr_matrix(
+            (np.ones(n_samples, dtype=np.float32), (np.arange(n_samples), labels)),
+            shape=(n_samples, num_clusters),
+        )
+        
+        A = A.T
+        A = A.todense()
+        sparse_codes = torch.from_numpy(A).to(dtype=torch.float32).to(device)
+    else:
+        k_sparse_coder = TopKSparseCoder(torch.tensor(centroids).to(dtype=torch.float32), k_sparse, 100, True, True)
+        sparse_codes = k_sparse_coder(torch.tensor(norm_patches).to(dtype=torch.float32).to(device))
+
     eigvals, eigvecs = spectral_decomp_dense_torch(sparse_codes, utterance_bounds)
 
     # take smallest d eigenvectors as P
     P = eigvecs[:, 1:d+1].T
 
     beta = P@sparse_codes.T
-    print("norm smt patches")
     norm_beta, _, _ = preprocess_patches(beta.T.numpy()) # this switches beta to be NxD like norm_patches
     norm_beta = norm_beta
 
     return {
-        "kmeans": kmeans,
+        "kmeans": centroids,
         "sparse_codes": sparse_codes,
         "norm_smt": norm_beta,
         "norm_mel": norm_patches,
@@ -768,6 +988,7 @@ def grid_search(
                     out["norm_mel"],
                     out["norm_smt"],
                     out["utterance_bounds"],
+                    int(500/cfg['patch_length']) # make blocks ~500ms always
                 )
                 entry["smt_stats"] = smt_stats
                 entry["mel_stats"] = mel_stats
