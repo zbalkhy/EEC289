@@ -170,7 +170,7 @@ def extract_features_from_dataset(
 ) -> dict[str, dict[str, np.ndarray | int]]:
     """Extract mel-spectrogram and MFCC for multiple audio files."""
     results: dict[str, dict[str, np.ndarray | int]] = {}
-    for i, sample in enumerate(ds):
+    for i, sample in enumerate(tqdm(ds, desc="log_mel extraction")):
         if i >= n_samples:
             break
         y = sample[0].numpy()
@@ -273,6 +273,7 @@ def preprocess_patches(patches: np.ndarray):
         patches = patches.reshape(patches.shape[0], -1)
     
     # subtract mean from patches
+    print("normalize patches")
     mean = np.mean(patches, axis=0)
     std = np.std(patches, axis=0)
     patches = (patches - mean)/(std + 1e-6)
@@ -280,6 +281,7 @@ def preprocess_patches(patches: np.ndarray):
     # whiten patches
     #pca = PCA(whiten=True)
     #patch_vectors = pca.fit_transform(patch_vectors)   
+    print("zca patches")
     zcaMatrix = zca_whitening_matrix(patches.T)
     patches = np.dot(zcaMatrix, patches.T) # project X onto the ZCAMatrix
     patches = patches.T
@@ -287,7 +289,7 @@ def preprocess_patches(patches: np.ndarray):
     # normalize patches
     patches = normalize(patches, norm='l2')
     
-    return patches, mean, zcaMatrix
+    return patches, mean, std, zcaMatrix
 
 def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
     """
@@ -309,7 +311,7 @@ def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
         patches = patches[indices]
     
     # Apply k-means
-    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=43, n_init=10)
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, n_init=20, max_iter=1000, verbose=True, batch_size=1000000)
     kmeans.fit(patches)
     return kmeans
 
@@ -434,7 +436,7 @@ def patch_multiple_utterances(mels: list[np.ndarray], sr, hop_length, patch_leng
     patches = []
     utterance_bounds = []
     start = 0
-    for mel in mels:
+    for mel in tqdm(mels, desc="patching"):
         p = extract_time_patches(
             features=mel,
             sr=sr,
