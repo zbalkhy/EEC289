@@ -90,6 +90,8 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer = None,
     grad_clip_norm: float = 5.0,
+    decode_method="greedy",
+    beam_width=10,
 ) -> EpochStats:
     training = optimizer is not None
     model.train(training)
@@ -126,19 +128,28 @@ def run_epoch(
             optimizer.step()
 
         with torch.no_grad():
-            pred_token_ids = ctc_greedy_decode(
-                log_probs_t.detach().cpu(),
-                feat_lens.cpu(),
-                blank_id=tokenizer.blank_id,
-            )
+            if decode_method=="greedy":
+                pred_token_ids = ctc_greedy_decode(
+                    log_probs_t.detach().cpu(),
+                    feat_lens.cpu(),
+                    blank_id=tokenizer.blank_id,
+                )
+            else:
+                pred_token_ids = ctc_beam_decode(
+                    log_probs=log_probs_t.detach().cpu(),
+                    input_lens=feat_lens.cpu(),
+                    blank_id=tokenizer.blank_id,
+                    beam_width=beam_width,
+                )
+
             pred_texts = [tokenizer.decode(ids) for ids in pred_token_ids]
 
             batch_cer = 0.0
             batch_wer = 0.0
             for ref, hyp in zip(texts, pred_texts):
-                ref_norm = ref #ref.lower()
+                ref_norm = ref.lower()
                 batch_cer += char_error_rate(ref_norm, hyp)
-                #batch_wer += word_error_rate(ref_norm, hyp)
+                batch_wer += word_error_rate(ref_norm, hyp)
 
             bsz = len(texts)
             total_cer += batch_cer
@@ -168,9 +179,18 @@ def train_ctc_model(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     grad_clip_norm: float = 5.0,
+    decode_method="greedy",
+    beam_width=10,
 ):
     model.to(device)
-
+    running_train_stats = {
+        "train_loss" : [],
+        "val_loss": [],
+        "train_CER": [],
+        "val_CER": [],
+        "train_WER": [],
+        "val_WER": [],
+    }
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
@@ -195,6 +215,8 @@ def train_ctc_model(
             device=device,
             optimizer=optimizer,
             grad_clip_norm=grad_clip_norm,
+            decode_method=decode_method,
+            beam_width=beam_width
         )
 
         with torch.no_grad():
@@ -205,6 +227,8 @@ def train_ctc_model(
                 tokenizer=tokenizer,
                 device=device,
                 optimizer=None,
+                decode_method=decode_method,
+                beam_width=beam_width
             )
 
         print(
@@ -216,6 +240,12 @@ def train_ctc_model(
             f"val_CER={val_stats.cer:.4f} "
             f"val_WER={val_stats.wer:.4f}"
         )
+        running_train_stats["train_CER"].append(train_stats.cer)
+        running_train_stats["train_WER"].append(train_stats.wer)
+        running_train_stats["train_loss"].append(train_stats.loss)
+        running_train_stats["val_CER"].append(val_stats.cer)
+        running_train_stats["val_WER"].append(val_stats.wer)
+        running_train_stats["val_loss"].append(val_stats.loss)
 
         if val_stats.cer < best_val_cer:
             best_val_cer = val_stats.cer
@@ -227,7 +257,7 @@ def train_ctc_model(
                 "val_wer": val_stats.wer,
             }
 
-    return best_state
+    return best_state, running_train_stats
 
 def load_trained_bilstm_model(
     checkpoint_path: str,

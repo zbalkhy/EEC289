@@ -6,6 +6,7 @@ from itertools import product
 
 import librosa
 import numpy as np
+import re
 
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.neighbors import NearestNeighbors
@@ -175,6 +176,7 @@ def extract_features_from_dataset(
             break
         y = sample[0].numpy()
         sr = sample[1]
+        text = re.sub(r"[^a-z0-9\s]", "", sample[2].lower())
         trimmed, _, _ = trim_silence(y.squeeze(), sr=sr)
         win_length = max(1, int(round(sr * (window_ms / 1000.0))))
         hop_length = max(1, int(round(sr * (hop_ms / 1000.0))))
@@ -205,6 +207,7 @@ def extract_features_from_dataset(
             "mel_spectrogram": mel_spectrogram.squeeze(),
             "log_mel_db": log_mel_db.squeeze(),
             "mfcc": mfcc,
+            "text": text,
         }
     return results
 
@@ -311,7 +314,7 @@ def apply_kmeans_to_patches(patches, n_clusters=100, sample_size=1000000):
         patches = patches[indices]
     
     # Apply k-means
-    kmeans = MiniBatchKMeans(n_clusters=n_clusters, n_init=20, max_iter=1000, verbose=True, batch_size=1000000)
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, n_init=3, max_iter=1000, verbose=True, batch_size=1000000)
     kmeans.fit(patches)
     return kmeans
 

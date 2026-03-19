@@ -1,11 +1,12 @@
 import math
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from collections import defaultdict
 
 PHONEMES = [
 'AA','AE','AH','AO','AW','AY','EH','ER','EY','IH','IY',
@@ -47,7 +48,6 @@ class CharTokenizer:
             return [self.id_to_char[i] for i in ids if i in self.id_to_char]
         else:
             return "".join(self.id_to_char[i] for i in ids if i in self.id_to_char)
-
 
 # -----------------------------
 # 3. Collate function
@@ -91,7 +91,6 @@ def ctc_collate_fn(batch: List[Dict], tokenizer: CharTokenizer) -> Dict[str, tor
         "texts": [item["text"] for item in batch],
     }
 
-
 # -----------------------------
 # 4. Greedy CTC decoding
 # -----------------------------
@@ -106,8 +105,9 @@ def ctc_greedy_decode(
     returns: list of token-id sequences after CTC collapse
     """
     pred_ids = log_probs.argmax(dim=-1)  # (T, B)
+    
     pred_ids = pred_ids.transpose(0, 1)  # (B, T)
-
+    #print(pred_ids.count_nonzero()/pred_ids.shape[1])
     decoded = []
     for b in range(pred_ids.shape[0]):
         seq = pred_ids[b, :input_lens[b]].tolist()
@@ -120,9 +120,135 @@ def ctc_greedy_decode(
         decoded.append(collapsed)
     return decoded
 
-
 # -----------------------------
-# 5. Error rate utilities
+# 5. beam search CTC decoding
+# -----------------------------
+
+
+NEG_INF = -1e30
+
+
+def logsumexp2(a: float, b: float) -> float:
+    if a <= NEG_INF:
+        return b
+    if b <= NEG_INF:
+        return a
+    if a > b:
+        return a + math.log1p(math.exp(b - a))
+    else:
+        return b + math.log1p(math.exp(a - b))
+
+
+def ctc_prefix_beam_search_single(
+    log_probs: torch.Tensor,
+    beam_width: int = 10,
+    blank_id: int = 0,
+) -> List[int]:
+    """
+    log_probs: (T, V) for one utterance
+    returns: best collapsed token sequence
+    """
+    if log_probs.ndim != 2:
+        raise ValueError(f"Expected (T, V), got {tuple(log_probs.shape)}")
+
+    T, V = log_probs.shape
+
+    # beams[prefix] = (p_blank, p_nonblank)
+    beams: Dict[Tuple[int, ...], Tuple[float, float]] = {
+        (): (0.0, NEG_INF)
+    }
+
+    for t in range(T):
+        next_beams = defaultdict(lambda: (NEG_INF, NEG_INF))
+        frame = log_probs[t]  # (V,)
+
+        # optional frame pruning
+        topk = min(beam_width, V)
+        _, top_ids = torch.topk(frame, k=topk)
+
+        for prefix, (p_b, p_nb) in beams.items():
+            # 1) emit blank
+            p_blank = float(frame[blank_id].item())
+            nb_pb, nb_pnb = next_beams[prefix]
+            nb_pb = logsumexp2(nb_pb, p_b + p_blank)
+            nb_pb = logsumexp2(nb_pb, p_nb + p_blank)
+            next_beams[prefix] = (nb_pb, nb_pnb)
+
+            # 2) emit non-blank
+            last = prefix[-1] if len(prefix) > 0 else None
+
+            for s in top_ids.tolist():
+                if s == blank_id:
+                    continue
+
+                p_s = float(frame[s].item())
+
+                if s == last:
+                    # (a) continue repeated symbol without changing collapsed prefix
+                    nb_pb, nb_pnb = next_beams[prefix]
+                    nb_pnb = logsumexp2(nb_pnb, p_nb + p_s)
+                    next_beams[prefix] = (nb_pb, nb_pnb)
+
+                    # (b) append same symbol only if previous path ended with blank
+                    new_prefix = prefix + (s,)
+                    nb_pb2, nb_pnb2 = next_beams[new_prefix]
+                    nb_pnb2 = logsumexp2(nb_pnb2, p_b + p_s)
+                    next_beams[new_prefix] = (nb_pb2, nb_pnb2)
+                else:
+                    new_prefix = prefix + (s,)
+                    nb_pb2, nb_pnb2 = next_beams[new_prefix]
+                    nb_pnb2 = logsumexp2(nb_pnb2, p_b + p_s)
+                    nb_pnb2 = logsumexp2(nb_pnb2, p_nb + p_s)
+                    next_beams[new_prefix] = (nb_pb2, nb_pnb2)
+
+        # prune
+        beams = dict(
+            sorted(
+                next_beams.items(),
+                key=lambda x: logsumexp2(x[1][0], x[1][1]),
+                reverse=True,
+            )[:beam_width]
+        )
+
+    best_prefix = max(
+        beams.items(),
+        key=lambda x: logsumexp2(x[1][0], x[1][1]),
+    )[0]
+
+    return list(best_prefix)
+
+def ctc_beam_decode(
+    log_probs: torch.Tensor,
+    input_lens: torch.Tensor,
+    blank_id: int,
+    beam_width: int = 10,
+) -> List[List[int]]:
+    """
+    Args:
+        log_probs: (T, B, V)
+        input_lens: (B,)
+    Returns:
+        List of decoded token-id sequences
+    """
+    if log_probs.ndim != 3:
+        raise ValueError(f"Expected log_probs shape (T, B, V), got {tuple(log_probs.shape)}")
+
+    T, B, V = log_probs.shape
+    decoded = []
+
+    for b in range(B):
+        Tb = int(input_lens[b].item())
+        lp = log_probs[:Tb, b, :]  # (Tb, V)
+        seq = ctc_prefix_beam_search_single(
+            log_probs=lp,
+            beam_width=beam_width,
+            blank_id=blank_id,
+        )
+        decoded.append(seq)
+
+    return decoded
+# -----------------------------
+# 6. Error rate utilities
 # -----------------------------
 def levenshtein_distance(ref: List[str], hyp: List[str]) -> int:
     """
@@ -146,7 +272,6 @@ def levenshtein_distance(ref: List[str], hyp: List[str]) -> int:
             )
     return dp[m][n]
 
-
 def char_error_rate(ref: str, hyp: str) -> float:
     ref_chars = list(ref)
     hyp_chars = list(hyp)
@@ -154,19 +279,12 @@ def char_error_rate(ref: str, hyp: str) -> float:
         return 0.0 if len(hyp_chars) == 0 else 1.0
     return levenshtein_distance(ref_chars, hyp_chars) / len(ref_chars)
 
-
 def word_error_rate(ref: str, hyp: str) -> float:
     ref_words = ref.split()
     hyp_words = hyp.split()
     if len(ref_words) == 0:
         return 0.0 if len(hyp_words) == 0 else 1.0
     return levenshtein_distance(ref_words, hyp_words) / len(ref_words)
-
-
-from typing import List, Dict, Union, Optional
-import torch
-import torch.nn.functional as F
-
 
 @torch.no_grad()
 def predict_batch(
@@ -177,45 +295,32 @@ def predict_batch(
     device: torch.device,
     return_log_probs: bool = False,
     return_confidence: bool = False,
-) -> Dict[str, Union[List[str], List[List[int]], torch.Tensor, List[float]]]:
-    """
-    Greedy CTC decoding for a batch.
-
-    Args:
-        model:
-            Trained SMTCTCLinear model.
-        features:
-            Tensor of shape (B, T, D)
-        feature_lens:
-            Tensor of shape (B,) with valid frame counts
-        tokenizer:
-            Must provide blank_id and decode(ids)
-        device:
-            cpu or cuda
-        return_log_probs:
-            If True, include frame-level log_probs (B, T, V) on CPU
-        return_confidence:
-            If True, include a simple confidence proxy per utterance
-
-    Returns:
-        dict with:
-            "texts": List[str]
-            "token_ids": List[List[int]]
-            optionally "log_probs": Tensor (B, T, V)
-            optionally "confidence": List[float]
-    """
+    decode_method: str = "beam",   # "beam" or "greedy"
+    beam_width: int = 10,
+):
     model.eval()
 
     features = features.to(device)
-    logits = model(features, feature_lens)                    # (B, T, V)
-    log_probs = F.log_softmax(logits, dim=-1)   # (B, T, V)
-    log_probs_t = log_probs.transpose(0, 1)     # (T, B, V)
+    logits = model(features, feature_lens)          # (B, T, V)
+    log_probs = F.log_softmax(logits, dim=-1)       # (B, T, V)
+    log_probs_t = log_probs.transpose(0, 1)         # (T, B, V)
 
-    pred_token_ids = ctc_greedy_decode(
-        log_probs=log_probs_t.cpu(),
-        input_lens=feature_lens.cpu(),
-        blank_id=tokenizer.blank_id,
-    )
+    if decode_method == "greedy":
+        pred_token_ids = ctc_greedy_decode(
+            log_probs=log_probs_t.cpu(),
+            input_lens=feature_lens.cpu(),
+            blank_id=tokenizer.blank_id,
+        )
+    elif decode_method == "beam":
+        pred_token_ids = ctc_beam_decode(
+            log_probs=log_probs_t.cpu(),
+            input_lens=feature_lens.cpu(),
+            blank_id=tokenizer.blank_id,
+            beam_width=beam_width,
+        )
+    else:
+        raise ValueError(f"Unknown decode_method: {decode_method}")
+
     pred_texts = [tokenizer.decode(ids) for ids in pred_token_ids]
 
     out = {
@@ -224,9 +329,7 @@ def predict_batch(
     }
 
     if return_confidence:
-        # Simple confidence proxy:
-        # average max posterior over valid frames
-        probs = log_probs.exp()  # (B, T, V)
+        probs = log_probs.exp()
         confs = []
         for b in range(probs.shape[0]):
             T = int(feature_lens[b].item())
@@ -242,7 +345,6 @@ def predict_batch(
 
     return out
 
-
 @torch.no_grad()
 def predict_one(
     model: torch.nn.Module,
@@ -251,21 +353,9 @@ def predict_one(
     device: torch.device,
     return_log_probs: bool = False,
     return_confidence: bool = False,
-) -> Dict[str, Union[str, List[int], torch.Tensor, float]]:
-    """
-    Greedy CTC decoding for a single utterance.
-
-    Args:
-        features:
-            Tensor of shape (T, D)
-
-    Returns:
-        dict with:
-            "text": str
-            "token_ids": List[int]
-            optionally "log_probs": Tensor (T, V)
-            optionally "confidence": float
-    """
+    decode_method: str = "beam",
+    beam_width: int = 10,
+):
     if features.ndim != 2:
         raise ValueError(f"Expected features with shape (T, D), got {tuple(features.shape)}")
 
@@ -280,6 +370,8 @@ def predict_one(
         device=device,
         return_log_probs=return_log_probs,
         return_confidence=return_confidence,
+        decode_method=decode_method,
+        beam_width=beam_width,
     )
 
     out = {
@@ -291,6 +383,8 @@ def predict_one(
         out["confidence"] = batch_out["confidence"][0]
 
     if return_log_probs:
-        out["log_probs"] = batch_out["log_probs"][0]  # (T, V)
+        out["log_probs"] = batch_out["log_probs"][0]
 
     return out
+
+

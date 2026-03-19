@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-
+from tqdm import tqdm
 
 def normalize_dictionary(D: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -136,7 +136,7 @@ def fista_topk_sparse_code(
     t = 1.0
     loss_history = []
 
-    for it in range(n_iters):
+    for it in tqdm(range(n_iters)):
         Z_prev = Z
 
         # Gradient of 0.5 ||X - YD||^2 wrt Y:
