@@ -17,6 +17,7 @@ from smt_accumulator import *
 import os
 import re
 from g2p_en import G2p
+from torchinfo import summary
 
 def make_dataloader(dataset, tokenizer, batch_size=16, shuffle=True, num_workers=0):
     return DataLoader(
@@ -109,18 +110,18 @@ def train_model(dataset,
     model = SMTCTCBiLSTM(
         d_in=d_in,
         vocab_size=tokenizer.vocab_size,
-        hidden_size=512,
+        hidden_size=256,
         dropout=0.1,
         use_layernorm=True,
     )
-
+    summary(model)
     best_state, train_stats = train_ctc_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         tokenizer=tokenizer,
         device=device,
-        num_epochs=50,
+        num_epochs=150,
         lr=1e-3,
         weight_decay=1e-4,
         grad_clip_norm=5.0,
@@ -132,9 +133,9 @@ def train_model(dataset,
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     main_dir = "/mnt/data/SMT"
-    patch_sizes = ['_50', '_80', '_100']
-    diff_orders = ['first', 'second']
-    data_sizes = [100, 500, 1000, 2000]
+    patch_sizes = ['_50']
+    diff_orders = ['second']
+    data_sizes = [8000]
 
     for patch_size in patch_sizes:
         patch_size_dir = os.path.join(main_dir, patch_size)
@@ -155,28 +156,28 @@ if __name__ == "__main__":
             train_text = text[:train_split]
             
             # ensure we are always using same validation set for better comparisons
-            val_bounds = utterance_bounds[-train_split:]
-            val_text = text[-train_split:]
+            val_bounds = utterance_bounds[-val_split:]
+            val_text = text[-val_split:]
             
 
-            # train log mel model on norm patches
-            best_state, train_stats = train_model(norm_patches,
-                                                  train_bounds,
-                                                  val_bounds,
-                                                  train_text,
-                                                  val_text,
-                                                  patch_size_dir)
-            if best_state is not None:
-                torch.save(best_state, os.path.join(patch_size_dir, f"mel_{patch_size}_{str(size)}_ctc.pt"))
-                print(f"Saved best mel for patchsize checkpoint with val CER={best_state['val_cer']:.4f}")
+            # # train log mel model on norm patches
+            # best_state, train_stats = train_model(norm_patches,
+            #                                       train_bounds,
+            #                                       val_bounds,
+            #                                       train_text,
+            #                                       val_text,
+            #                                       patch_size_dir)
+            # if best_state is not None:
+            #     torch.save(best_state, os.path.join(patch_size_dir, f"mel_{patch_size}_{str(size)}_ctc.pt"))
+            #     print(f"Saved best mel for {patch_size}_{str(size)} checkpoint with val CER={best_state['val_cer']:.4f}")
     
-            # Define the filename
-            filename = f'{patch_size}_{str(size)}_mel_training_stats.json'
+            # # Define the filename
+            # filename = f'{patch_size}_{str(size)}_mel_training_stats.json'
 
-            # Open the file in write mode ('w') and use json.dump()
-            with open(filename, 'w') as json_file:
-                json.dump(train_stats, json_file, indent=4) # The indent parameter adds formatting for human-readabilit
-            torch.cuda.empty_cache()
+            # # Open the file in write mode ('w') and use json.dump()
+            # with open(filename, 'w') as json_file:
+            #     json.dump(train_stats, json_file, indent=4) # The indent parameter adds formatting for human-readabilit
+            # torch.cuda.empty_cache()
             # train first and second order difference on smt model
             for difference in diff_orders:
                 diff_dir = os.path.join(patch_size_dir, difference)
@@ -199,7 +200,7 @@ if __name__ == "__main__":
                                                   patch_size_dir)
                 if best_state is not None:
                     torch.save(best_state, os.path.join(patch_size_dir, f"smt_{patch_size}_{str(size)}_{difference}_ctc.pt"))
-                    print(f"Saved best mel for patchsize checkpoint with val CER={best_state['val_cer']:.4f}")
+                    print(f"Saved best smt {patch_size}_{str(size)}_{difference} checkpoint with val CER={best_state['val_cer']:.4f}")
         
                 # Define the filename
                 filename = f'{patch_size}_{str(size)}_{difference}_smt_training_stats.json'
@@ -208,5 +209,9 @@ if __name__ == "__main__":
                 with open(filename, 'w') as json_file:
                     json.dump(train_stats, json_file, indent=4) # The indent parameter adds formatting for human-readabilit
 
-                torch.cuda.empty_cache()
+                
                 del norm_beta
+                del best_state
+                del beta
+                del P
+                torch.cuda.empty_cache()

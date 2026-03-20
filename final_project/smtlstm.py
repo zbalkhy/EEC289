@@ -14,7 +14,7 @@ class SMTCTCBiLSTM(nn.Module):
         use_layernorm: bool = True,
     ):
         """
-        1-layer BiLSTM CTC model.
+        2-layer BiLSTM CTC model.
 
         Args:
             d_in: input SMT feature dimension
@@ -31,9 +31,10 @@ class SMTCTCBiLSTM(nn.Module):
         self.lstm = nn.LSTM(
             input_size=d_in,
             hidden_size=hidden_size,
-            num_layers=1,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
+            dropout=dropout if dropout > 0 else 0.0,
         )
 
         self.out_drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
