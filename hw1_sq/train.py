@@ -215,6 +215,13 @@ def run_stage(
     env = registry.load(env_name, config=env_cfg, config_overrides=build_env_overrides(config))
     eval_env = registry.load(env_name, config=env_cfg, config_overrides=build_env_overrides(config))
 
+    # Initialize stage 2 curriculum tracking if applicable
+    if stage_name == "stage_2":
+        if hasattr(env, "_stage2_start_step"):
+            env._stage2_start_step = 0
+        if hasattr(eval_env, "_stage2_start_step"):
+            eval_env._stage2_start_step = 0
+
     randomization_fn = None
     if config.get("use_domain_randomization", False):
         randomization_fn = registry.get_domain_randomizer(env_name)
@@ -228,10 +235,29 @@ def run_stage(
 
     def progress_fn(num_steps: int, metrics: dict[str, Any]) -> None:
         timing_points.append(time.monotonic())
+        
+        # Update global step in both environments for curriculum tracking
+        if hasattr(env, "_global_step"):
+            env._global_step = int(num_steps)
+        if hasattr(eval_env, "_global_step"):
+            eval_env._global_step = int(num_steps)
+        
         record = {
             "num_steps": int(num_steps),
             "metrics": to_jsonable(metrics),
         }
+        
+        # Add curriculum state if applicable
+        if stage_name == "stage_2" and hasattr(env, "_curriculum_cfg"):
+            if env._curriculum_cfg.get("enabled", False):
+                # Log current curriculum state for tracking
+                record["curriculum_state"] = {
+                    "vy_keep_prob_start": float(env._curriculum_cfg.get("vy_keep_prob_start", 0.01)),
+                    "vy_keep_prob_end": float(env._curriculum_cfg.get("vy_keep_prob_end", 0.5)),
+                    "yaw_keep_prob_start": float(env._curriculum_cfg.get("yaw_keep_prob_start", 0.1)),
+                    "yaw_keep_prob_end": float(env._curriculum_cfg.get("yaw_keep_prob_end", 0.5)),
+                }
+        
         progress_history.append(record)
         save_json(stage_dir / "progress_live.json", progress_history)
         save_json(stage_dir / "latest_metrics.json", record)

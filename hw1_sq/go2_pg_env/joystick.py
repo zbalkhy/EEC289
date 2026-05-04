@@ -189,6 +189,13 @@ class Joystick(go2_base.Go2Env):
         self._student_stage2_goal_max = jp.array(self._config.command_config.student_stage2_goal_max)
         self._student_stage2_goal_b = jp.array(self._config.command_config.student_stage2_goal_b)
 
+        # Curriculum scheduling for stage 2
+        self._global_step = 0
+        self._stage2_start_step = 0
+        self._curriculum_cfg = getattr(self._config, "curriculum_schedule", None)
+        if self._curriculum_cfg is None:
+            self._curriculum_cfg = {"enabled": False}
+
     def reset(self, rng: jax.Array) -> mjx_env.State:
         qpos = self._init_q
         qvel = jp.zeros(self.mjx_model.nv)
@@ -549,24 +556,55 @@ class Joystick(go2_base.Go2Env):
             return self._student_stage2_sampling_profile(current_command)
         return self._cmd_min, self._cmd_max, self._cmd_b
 
+    def _interpolate_keep_prob(self, start_prob: float, end_prob: float, stage2_total_steps: int) -> jax.Array:
+        """Linearly interpolate keep_prob from start to end over stage 2 duration."""
+        # Compute progress: 0 at start, 1 at end
+        steps_since_stage2_start = jp.clip(self._global_step - self._stage2_start_step, 0, stage2_total_steps)
+        progress = steps_since_stage2_start / jp.maximum(stage2_total_steps, 1)
+        progress = jp.clip(progress, 0.0, 1.0)
+        
+        # Linear interpolation
+        return jp.asarray(start_prob + progress * (end_prob - start_prob))
+
     def _student_stage2_sampling_profile(self, current_command: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Homework seam for stage_2 command sampling.
+        """Homework seam for stage_2 command sampling with optional curriculum.
 
-        TODO(student): keep stage_1 as the fixed forward-only baseline, and use
-        stage_2 to expand the command distribution beyond `{stand, +vx}`.
-
-        The current baseline intentionally returns the same forward-only profile
-        as stage_1, so the public benchmark still exposes missing lateral / yaw
-        capability. A good stage_2 implementation should eventually use the
-        stored `self._student_stage2_goal_*` values below.
-
-        Suggested approach:
-        1. keep the baseline forward-only ranges as the starting point
-        2. widen the stage_2 sampling range toward `self._student_stage2_goal_*`
-        3. increase the probability of non-zero `vy` and `yaw_rate` commands
+        If curriculum_schedule is enabled in config, linearly interpolates
+        command_keep_prob from start to end values over stage 2 training.
+        
+        Otherwise, uses the fixed student_stage2_goal values.
         """
         del current_command
-        return self._student_stage2_goal_min, self._student_stage2_goal_max, self._student_stage2_goal_b
+        
+        # Check if curriculum scheduling is enabled
+        if self._curriculum_cfg.get("enabled", False):
+            # Get stage 2 duration from ppo config (estimate: num_timesteps / num_envs)
+            # For now, use a reasonable estimate based on config
+            stage2_total_steps = int(self._config.episode_length) * 1000  # Conservative estimate
+            
+            # Interpolate vy and yaw keep_prob
+            vy_prob = self._interpolate_keep_prob(
+                float(self._curriculum_cfg.get("vy_keep_prob_start", 0.01)),
+                float(self._curriculum_cfg.get("vy_keep_prob_end", 0.5)),
+                stage2_total_steps,
+            )
+            yaw_prob = self._interpolate_keep_prob(
+                float(self._curriculum_cfg.get("yaw_keep_prob_start", 0.1)),
+                float(self._curriculum_cfg.get("yaw_keep_prob_end", 0.5)),
+                stage2_total_steps,
+            )
+            
+            # Build interpolated keep_prob array
+            interpolated_b = jp.array([
+                self._student_stage2_goal_b[0],  # vx stays constant
+                vy_prob,                         # vy interpolates
+                yaw_prob,                        # yaw interpolates
+            ])
+            
+            return self._student_stage2_goal_min, self._student_stage2_goal_max, interpolated_b
+        else:
+            # No curriculum: use fixed values
+            return self._student_stage2_goal_min, self._student_stage2_goal_max, self._student_stage2_goal_b
 
     def sample_command(self, rng: jax.Array, current_command: jax.Array) -> jax.Array:
         rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
