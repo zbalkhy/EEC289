@@ -1,0 +1,15 @@
+{
+  "VPT50@0.25": 16,
+  "VPT80@0.25": 7,
+  "VPT80_fraction": 0.07,
+  "checkpoint_step": 1000,
+  "max_horizon": 100,
+  "model_name": "student",
+  "nMSE@10": 0.07866896688938141,
+  "nMSE@100": 561.0543823242188,
+  "nMSE@90": 403.23876953125,
+  "nMSE_AUC": 130.208740234375,
+  "primary_metric": "VPT80@0.25",
+  "step_nMSE@10": 0.17052024602890015,
+  "step_nMSE@100": 2247.0732421875
+}
