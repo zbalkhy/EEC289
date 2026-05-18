@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from .rollout import open_loop_rollout
-
+from wm_hw.model_utils import predict_next
 
 def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer) -> torch.Tensor:
     obs = states[:, :-1].reshape(-1, states.shape[-1])
@@ -29,17 +29,21 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
             f"need at least {needed_states - 1} actions for warmup={warmup_steps}, horizon={horizon}."
         )
     max_start = states.shape[1] - needed_states
-    if max_start > 0:
-        start = int(torch.randint(0, max_start + 1, (), device=states.device).item())
-    else:
-        start = 0
-    sub_states = states[:, start : start + needed_states]
-    sub_actions = actions[:, start : start + int(warmup_steps) + int(horizon)]
-    preds = open_loop_rollout(model, sub_states, sub_actions, normalizer, warmup_steps=warmup_steps, horizon=horizon)
-    targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
-    pred_norm = normalizer.normalize_obs(preds)
-    target_norm = normalizer.normalize_obs(targets)
-    return F.mse_loss(pred_norm, target_norm)
+    # if max_start > 0:
+    #     start = int(torch.randint(0, max_start + 1, (), device=states.device).item())
+    # else:
+    #     start = 0
+    window_losses = []
+    for i in range(0, max_start, max(max_start // 3, 1)):
+        start = i
+        sub_states = states[:, start : start + needed_states]
+        sub_actions = actions[:, start : start + int(warmup_steps) + int(horizon)]
+        preds = open_loop_rollout(model, sub_states, sub_actions, normalizer, warmup_steps=warmup_steps, horizon=horizon)
+        targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
+        pred_norm = normalizer.normalize_obs(preds)
+        target_norm = normalizer.normalize_obs(targets)
+        window_losses.append((i/max_start)*F.mse_loss(pred_norm, target_norm))
+    return sum(window_losses)
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
