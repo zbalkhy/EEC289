@@ -26,9 +26,9 @@ class StudentWorldModel(nn.Module):
         self.delta_limit = float(delta_limit)
         in_dim = obs_dim + act_dim
 
-        #self.lin = nn.Linear(in_dim, obs_dim)
+        self.lin = nn.Linear(in_dim, obs_dim)
         self.kinematic_scale = nn.Parameter(torch.tensor([1.0,0.9]))
-        self.residual_scale = nn.Parameter(torch.tensor([0.05, 0.05, 1.0, 1.0]))
+        self.residual_scale = nn.Parameter(torch.tensor([0.03, 0.08, 1.0, 1.0]))
 
         layers: list[nn.Module] = []
         for _ in range(int(num_layers)):
@@ -41,10 +41,12 @@ class StudentWorldModel(nn.Module):
         
         # Initialize head weights to zero
         init.zeros_(self.head.weight)
+        init.zeros_(self.lin.weight)
 
         # Initialize head bias to zero
         if self.head.bias is not None:
             init.zeros_(self.head.bias)
+            init.zeros_(self.lin.bias)
 
         
 
@@ -62,13 +64,14 @@ class StudentWorldModel(nn.Module):
                 hidden = self.initial_hidden(obs_norm.shape[0], obs_norm.device)
             hidden = self.gru(feat, hidden)
             feat = hidden
-        resid = self.head(feat)
-        raw_delta = resid*self.residual_scale
+        resid = self.head(feat) * self.residual_scale
+
+        linear_delta = self.lin(obs_act)
+        raw_delta = linear_delta + resid
+    
         raw_delta[...,0] += self.kinematic_scale[0] * obs_norm[...,2]
         raw_delta[...,1] += self.kinematic_scale[1] * obs_norm[...,3]
         
-        #raw_delta_linear = self.lin(torch.cat([obs_norm, act_norm], dim=-1))
-        #raw_delta = raw_delta_linear + raw_delta_nl
         delta = raw_delta.clone()
         delta[..., 2:] = self.delta_limit * torch.tanh(raw_delta[..., 2:] / self.delta_limit)
         return delta, hidden

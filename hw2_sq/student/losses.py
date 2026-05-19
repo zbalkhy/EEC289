@@ -108,7 +108,7 @@ def rollout_loss(
         target_norm = normalizer.normalize_obs(targets)
         per_step_nmse = torch.mean((pred_norm - target_norm) ** 2, dim=-1)
         if cap_nmse is not None and float(cap_nmse) > 0.0:
-            base = torch.clamp(per_step_nmse, max=float(cap_nmse)).mean()
+            base = float(cap_nmse) * torch.log1p(per_step_nmse / float(cap_nmse)).mean()
         else:
             base = per_step_nmse.mean()
         roll = base
