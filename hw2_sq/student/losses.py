@@ -39,8 +39,11 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
     pred_norm = normalizer.normalize_obs(preds)
     target_norm = normalizer.normalize_obs(targets)
-    weights = torch.arange(0, 1, 1/target_norm.shape[1])
-    weights = weights.view(1, target_norm.shape[1], 1).repeat(target_norm.shape[0], 1, target_norm.shape[2]).to(target_norm.device)
+    weights = torch.arange(
+        1, target_norm.shape[1]+1,
+        device=target_norm.device,
+        dtype=target_norm.dtype
+    ).view(1,-1,1).expand_as(target_norm)
     return F.mse_loss(pred_norm, target_norm, weight=weights)
 
     # window_losses = []

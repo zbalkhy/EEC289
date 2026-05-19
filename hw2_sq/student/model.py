@@ -32,6 +32,7 @@ class StudentWorldModel(nn.Module):
             layers += [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
             in_dim = hidden_dim
         self.encoder = nn.Sequential(*layers)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) if self.use_gru else None
         self.head = nn.Linear(hidden_dim, obs_dim)
 
@@ -45,6 +46,7 @@ class StudentWorldModel(nn.Module):
     def forward(self, obs_norm: torch.Tensor, act_norm: torch.Tensor, hidden=None):
         obs_act = torch.cat([obs_norm, act_norm], dim=-1)
         feat = self.encoder(obs_act)
+        feat = self.layer_norm(feat)
         if self.gru is not None:
             if hidden is None:
                 hidden = self.initial_hidden(obs_norm.shape[0], obs_norm.device)

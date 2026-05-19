@@ -3,15 +3,16 @@ device: auto
 torch_num_threads: 1
 
 model:
-  hidden_dim: 1024
-  num_layers: 8
+  hidden_dim: 256
+  num_layers: 3
   use_gru: true
+  delta_limit: 2.5
 
 training:
   batch_size: 128
   updates: 4000
   smoke_updates: 120
-  train_sequence_length: 55
+  train_sequence_length: 64
   learning_rate: 1.0e-3
   grad_clip_norm: 10.0
   eval_every: 200
@@ -22,9 +23,9 @@ training:
   checkpoint_mode: max
 
 loss:
-  one_step_weight: 2.0
-  rollout_weight: 1.0
-  rollout_train_horizon: 25
+  one_step_weight: 1.0
+  rollout_weight: 2.0
+  rollout_train_horizon: 40
 
 eval:
   warmup_steps: 10
