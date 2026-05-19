@@ -93,7 +93,7 @@ def rollout_loss(
             f"need at least {needed_states - 1} actions for warmup={warmup_steps}, horizon={horizon}."
         )
     max_start = states.shape[1] - needed_states
-
+    #max_start = needed_states + 10
     losses = []
     for _ in range(max(int(windows_per_batch), 1)):
         if max_start > 0:

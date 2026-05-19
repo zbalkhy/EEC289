@@ -65,7 +65,7 @@ class StudentWorldModel(nn.Module):
         resid = self.head(feat)
         raw_delta = resid*self.residual_scale
         raw_delta[...,0] += self.kinematic_scale[0] * obs_norm[...,2]
-        raw_delta[...,1] += self.kinematic_scale[0] * obs_norm[...,3]
+        raw_delta[...,1] += self.kinematic_scale[1] * obs_norm[...,3]
         
         #raw_delta_linear = self.lin(torch.cat([obs_norm, act_norm], dim=-1))
         #raw_delta = raw_delta_linear + raw_delta_nl
