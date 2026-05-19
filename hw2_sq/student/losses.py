@@ -6,17 +6,48 @@ import torch
 import torch.nn.functional as F
 
 from .rollout import open_loop_rollout
-from wm_hw.model_utils import predict_next
+
+_LOSS_CALLS = 0
+
+
+def rollout_curriculum_horizon(loss_cfg: dict) -> int:
+    curriculum = loss_cfg.get("rollout_curriculum", {})
+    if not curriculum.get("enabled", False):
+        return int(loss_cfg.get("rollout_train_horizon", 5))
+
+    update = max(_LOSS_CALLS, 1)
+    start = int(curriculum.get("start_horizon", 5))
+    end = int(curriculum.get("end_horizon", loss_cfg.get("rollout_train_horizon", start)))
+    warmup = int(curriculum.get("warmup_updates", 0))
+    ramp = max(int(curriculum.get("ramp_updates", 1)), 1)
+
+    if update <= warmup:
+        return start
+
+    progress = min((update - warmup) / ramp, 1.0)
+    horizon = round(start + progress * (end - start))
+    return max(1, int(horizon))
+
 
 def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer) -> torch.Tensor:
-    obs = states[:, :-1].reshape(-1, states.shape[-1])
-    act = actions.reshape(-1, actions.shape[-1])
-    target_delta = (states[:, 1:] - states[:, :-1]).reshape(-1, states.shape[-1])
-    obs_norm = normalizer.normalize_obs(obs)
-    act_norm = normalizer.normalize_act(act)
-    target_norm = normalizer.normalize_delta(target_delta)
-    pred_norm, _ = model(obs_norm, act_norm, None)
-    return F.mse_loss(pred_norm, target_norm)
+    if states.shape[1] != actions.shape[1] + 1:
+        raise ValueError(
+            "one-step loss expects states to have exactly one more time step than actions: "
+            f"got states={states.shape[1]}, actions={actions.shape[1]}."
+        )
+
+    hidden = model.initial_hidden(states.shape[0], states.device)
+    step_losses = []
+    for t in range(actions.shape[1]):
+        obs_norm = normalizer.normalize_obs(states[:, t])
+        act_norm = normalizer.normalize_act(actions[:, t])
+        target_delta = states[:, t + 1] - states[:, t]
+        target_norm = normalizer.normalize_delta(target_delta)
+
+        pred_norm, hidden = model(obs_norm, act_norm, hidden)
+        step_losses.append(F.mse_loss(pred_norm, target_norm, reduction="none"))
+
+    return torch.stack(step_losses, dim=1).mean()
 
 
 def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer, warmup_steps: int, horizon: int) -> torch.Tensor:
@@ -39,11 +70,12 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
     pred_norm = normalizer.normalize_obs(preds)
     target_norm = normalizer.normalize_obs(targets)
-    weights = torch.arange(
+    weights = torch.sqrt(torch.arange(
         1, target_norm.shape[1]+1,
         device=target_norm.device,
         dtype=target_norm.dtype
-    ).view(1,-1,1).expand_as(target_norm)
+    )).view(1,-1,1).expand_as(target_norm)
+    weights = weights / weights.mean()
     return F.mse_loss(pred_norm, target_norm, weight=weights)
 
     # window_losses = []
@@ -60,11 +92,17 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
+
+    global _LOSS_CALLS
+    _LOSS_CALLS += 1
+
+
     loss_cfg = cfg["loss"]
     states = batch["states"]
     actions = batch["actions"]
     one = one_step_delta_loss(model, states, actions, normalizer)
-    horizon = int(loss_cfg.get("rollout_train_horizon", 5))
+    horizon = rollout_curriculum_horizon(loss_cfg)
+
     warmup = int(cfg["eval"].get("warmup_steps", 5))
     roll = rollout_loss(model, states, actions, normalizer, warmup_steps=warmup, horizon=horizon)
     total = float(loss_cfg.get("one_step_weight", 1.0)) * one + float(loss_cfg.get("rollout_weight", 0.3)) * roll
@@ -72,4 +110,5 @@ def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
         "loss/total": float(total.detach().cpu()),
         "loss/one_step": float(one.detach().cpu()),
         "loss/rollout": float(roll.detach().cpu()),
+        "loss/rollout_horizon": float(horizon),
     }
