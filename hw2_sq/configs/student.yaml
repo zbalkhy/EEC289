@@ -10,11 +10,11 @@ model:
 
 training:
   batch_size: 128
-  updates: 6000
+  updates: 4000
   smoke_updates: 120
   train_sequence_length: 160
-  learning_rate: 2.0e-4
-  grad_clip_norm: 5.0
+  learning_rate: 1.0e-4
+  grad_clip_norm: 2.0
   eval_every: 250
   smoke_eval_every: 20
   val_horizon: 200
@@ -23,17 +23,24 @@ training:
   checkpoint_mode: max
 
 loss:
-  one_step_weight: 1.0
-  rollout_weight: 0.5
-  rollout_train_horizon: 15
+  one_step_weight: 2.0
+  short_rollout_weight: 1.0
+  short_rollout_horizon: 24
+  short_rollout_windows_per_batch: 2
+  short_rollout_cap_nmse: 1.0
+  short_rollout_margin_threshold: 0.18
+  short_rollout_margin_weight: 0.75
+  rollout_weight: 0.2
+  rollout_train_horizon: 90
   rollout_windows_per_batch: 1
+  long_rollout_cap_nmse: 1.0
 
   rollout_curriculum:
     enabled: true
-    start_horizon: 15
+    start_horizon: 30
     end_horizon: 90
-    warmup_updates: 1000
-    ramp_updates: 8000
+    warmup_updates: 1500
+    ramp_updates: 4000
 
 eval:
   warmup_steps: 10

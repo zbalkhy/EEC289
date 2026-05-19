@@ -81,8 +81,9 @@ def rollout_loss(
     horizon: int,
     *,
     windows_per_batch: int = 1,
-    vpt_threshold: float | None = None,
-    vpt_weight: float = 0.0,
+    cap_nmse: float | None = 1.0,
+    margin_threshold: float | None = None,
+    margin_weight: float = 0.0,
 ) -> torch.Tensor:
     # Train local open-loop stability at random positions, not only at the
     # beginning of each stored window.
@@ -93,7 +94,6 @@ def rollout_loss(
             f"need at least {needed_states - 1} actions for warmup={warmup_steps}, horizon={horizon}."
         )
     max_start = states.shape[1] - needed_states
-    #max_start = needed_states + 10
     losses = []
     for _ in range(max(int(windows_per_batch), 1)):
         if max_start > 0:
@@ -107,24 +107,18 @@ def rollout_loss(
         pred_norm = normalizer.normalize_obs(preds)
         target_norm = normalizer.normalize_obs(targets)
         per_step_nmse = torch.mean((pred_norm - target_norm) ** 2, dim=-1)
-        # use a clamped huber style loss to reduce weighting far off errors which are nuisance or hard to track
-        base = torch.clamp(per_step_nmse, max=1.0).mean()
-        margin = F.softplus(20.0*(per_step_nmse - 0.20)) / 20.0
-        roll = base + 0.5 * torch.clamp(margin, max=1.0).mean()
+        if cap_nmse is not None and float(cap_nmse) > 0.0:
+            base = torch.clamp(per_step_nmse, max=float(cap_nmse)).mean()
+        else:
+            base = per_step_nmse.mean()
+        roll = base
+        if margin_threshold is not None and float(margin_weight) > 0.0:
+            margin = F.softplus(20.0 * (per_step_nmse - float(margin_threshold))) / 20.0
+            if cap_nmse is not None and float(cap_nmse) > 0.0:
+                margin = torch.clamp(margin, max=float(cap_nmse))
+            roll = roll + float(margin_weight) * margin.mean()
         losses.append(roll)
     return torch.stack(losses).mean()
-
-    # window_losses = []
-    # for i in range(0, max_start, max(max_start // 3, 1)):
-    #     start = i
-    #     sub_states = states[:, start : start + needed_states]
-    #     sub_actions = actions[:, start : start + int(warmup_steps) + int(horizon)]
-    #     preds = open_loop_rollout(model, sub_states, sub_actions, normalizer, warmup_steps=warmup_steps, horizon=horizon)
-    #     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
-    #     pred_norm = normalizer.normalize_obs(preds)
-    #     target_norm = normalizer.normalize_obs(targets)
-    #     window_losses.append((i/max_start)*F.mse_loss(pred_norm, target_norm))
-    # return sum(window_losses)
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
@@ -133,24 +127,48 @@ def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
     actions = batch["actions"]
     one = one_step_delta_loss(model, states, actions, normalizer)
     update = _next_loss_call(model)
-    horizon = rollout_curriculum_horizon(loss_cfg, update)
+    long_horizon = rollout_curriculum_horizon(loss_cfg, update)
+    short_horizon = int(loss_cfg.get("short_rollout_horizon", 0))
 
     warmup = int(cfg["eval"].get("warmup_steps", 5))
-    roll = rollout_loss(
+    if short_horizon > 0 and float(loss_cfg.get("short_rollout_weight", 0.0)) > 0.0:
+        short_roll = rollout_loss(
+            model,
+            states,
+            actions,
+            normalizer,
+            warmup_steps=warmup,
+            horizon=short_horizon,
+            windows_per_batch=int(loss_cfg.get("short_rollout_windows_per_batch", 1)),
+            cap_nmse=loss_cfg.get("short_rollout_cap_nmse", None),
+            margin_threshold=loss_cfg.get("short_rollout_margin_threshold"),
+            margin_weight=float(loss_cfg.get("short_rollout_margin_weight", 0.0)),
+        )
+    else:
+        short_roll = states.new_tensor(0.0)
+
+    long_roll = rollout_loss(
         model,
         states,
         actions,
         normalizer,
         warmup_steps=warmup,
-        horizon=horizon,
+        horizon=long_horizon,
         windows_per_batch=int(loss_cfg.get("rollout_windows_per_batch", 1)),
-        vpt_threshold=loss_cfg.get("vpt_threshold"),
-        vpt_weight=float(loss_cfg.get("vpt_weight", 0.0)),
+        cap_nmse=loss_cfg.get("long_rollout_cap_nmse", 1.0),
+        margin_threshold=loss_cfg.get("long_rollout_margin_threshold"),
+        margin_weight=float(loss_cfg.get("long_rollout_margin_weight", 0.0)),
     )
-    total = float(loss_cfg.get("one_step_weight", 1.0)) * one + float(loss_cfg.get("rollout_weight", 0.3)) * roll
+    total = (
+        float(loss_cfg.get("one_step_weight", 1.0)) * one
+        + float(loss_cfg.get("short_rollout_weight", 0.0)) * short_roll
+        + float(loss_cfg.get("rollout_weight", 0.3)) * long_roll
+    )
     return total, {
         "loss/total": float(total.detach().cpu()),
         "loss/one_step": float(one.detach().cpu()),
-        "loss/rollout": float(roll.detach().cpu()),
-        "loss/rollout_horizon": float(horizon),
+        "loss/short_rollout": float(short_roll.detach().cpu()),
+        "loss/short_rollout_horizon": float(short_horizon),
+        "loss/rollout": float(long_roll.detach().cpu()),
+        "loss/rollout_horizon": float(long_horizon),
     }
