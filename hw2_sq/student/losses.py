@@ -93,6 +93,7 @@ def rollout_loss(
             f"need at least {needed_states - 1} actions for warmup={warmup_steps}, horizon={horizon}."
         )
     max_start = states.shape[1] - needed_states
+
     losses = []
     for _ in range(max(int(windows_per_batch), 1)):
         if max_start > 0:
@@ -106,17 +107,11 @@ def rollout_loss(
         pred_norm = normalizer.normalize_obs(preds)
         target_norm = normalizer.normalize_obs(targets)
         per_step_nmse = torch.mean((pred_norm - target_norm) ** 2, dim=-1)
-        weights = torch.sqrt(torch.arange(
-            1, per_step_nmse.shape[1]+1,
-            device=per_step_nmse.device,
-            dtype=per_step_nmse.dtype
-        )).view(1,-1)
-        weights = weights / weights.mean()
-        mse = torch.mean(per_step_nmse * weights)
-        if vpt_threshold is not None and float(vpt_weight) > 0.0:
-            threshold_penalty = torch.mean(F.relu(per_step_nmse - float(vpt_threshold)).pow(2) * weights)
-            mse = mse + float(vpt_weight) * threshold_penalty
-        losses.append(mse)
+        # use a clamped huber style loss to reduce weighting far off errors which are nuisance or hard to track
+        base = torch.clamp(per_step_nmse, max=1.0).mean()
+        margin = F.softplus(20.0*(per_step_nmse - 0.20)) / 20.0
+        roll = base + 0.5 * torch.clamp(margin, max=1.0).mean()
+        losses.append(roll)
     return torch.stack(losses).mean()
 
     # window_losses = []
