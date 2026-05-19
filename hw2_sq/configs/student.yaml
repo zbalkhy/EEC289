@@ -3,9 +3,9 @@ device: auto
 torch_num_threads: 1
 
 model:
-  hidden_dim: 256
-  num_layers: 3
-  use_gru: True
+  hidden_dim: 512
+  num_layers: 4
+  use_gru: false
   delta_limit: 2.5
 
 training:
@@ -26,6 +26,9 @@ loss:
   one_step_weight: 1.0
   rollout_weight: 0.2
   rollout_train_horizon: 120
+  rollout_windows_per_batch: 2
+  vpt_threshold: 0.10
+  vpt_weight: 4.0
 
   rollout_curriculum:
     enabled: true
