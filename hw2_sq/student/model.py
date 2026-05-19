@@ -24,6 +24,9 @@ class StudentWorldModel(nn.Module):
         self.use_gru = bool(use_gru)
         self.delta_limit = float(delta_limit)
         in_dim = obs_dim + act_dim
+
+        self.lin = nn.Linear(in_dim, obs_dim)
+        
         layers: list[nn.Module] = []
         for _ in range(int(num_layers)):
             layers += [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
@@ -32,18 +35,23 @@ class StudentWorldModel(nn.Module):
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) if self.use_gru else None
         self.head = nn.Linear(hidden_dim, obs_dim)
 
+        
+
     def initial_hidden(self, batch_size: int, device: torch.device):
         if not self.use_gru:
             return None
         return torch.zeros(batch_size, self.gru.hidden_size, device=device)
 
     def forward(self, obs_norm: torch.Tensor, act_norm: torch.Tensor, hidden=None):
-        feat = self.encoder(torch.cat([obs_norm, act_norm], dim=-1))
+        obs_act = torch.cat([obs_norm, act_norm], dim=-1)
+        feat = self.encoder(obs_act)
         if self.gru is not None:
             if hidden is None:
                 hidden = self.initial_hidden(obs_norm.shape[0], obs_norm.device)
             hidden = self.gru(feat, hidden)
             feat = hidden
-        raw_delta = self.head(feat)
+        raw_delta_nl = self.head(feat)
+        raw_delta_linear = self.lin(torch.cat([obs_norm, act_norm], dim=-1))
+        raw_delta = raw_delta_linear + raw_delta_nl
         delta = self.delta_limit * torch.tanh(raw_delta / self.delta_limit)
         return delta, hidden
