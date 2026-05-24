@@ -40,11 +40,10 @@ class StudentWorldModel(nn.Module):
     def calc_angular_velocity_delta(self, m1, m2, l, k_t, theta, F, g):
         total_mass = m1+m2
         mass_length = m2*l
-
-        return (mass_length*F + total_mass*mass_length*g*theta)/(total_mass*(k_t+ mass_length) - mass_length**2)
+        return (mass_length*F + total_mass*mass_length*g*theta)/(total_mass*(k_t+ mass_length*l) - mass_length**2 + 1e-6)
     
     def calc_velocity_delta(self, m1, m2, l, theta_acc, F):
-        return (m2*l*theta_acc + F)/(m1+m2)
+        return (m2*l*theta_acc + F)/(m1+m2 + 1e-6)
     
     def forward(self, obs_norm: torch.Tensor, act_norm: torch.Tensor, hidden=None):
         feat = self.encoder(torch.cat([obs_norm, act_norm], dim=-1))
@@ -56,9 +55,11 @@ class StudentWorldModel(nn.Module):
         raw_delta = self.head(feat)
         
         # assign raw_delta as [m1, m2, l, k_t]
-        d_theta = self.calc_angular_velocity_delta(raw_delta[0], raw_delta[1], 
-                                                   raw_delta[2], raw_delta[3],
-                                                   obs_norm[0,:], act_norm, 9.81)
-        d_velocity = self.calc_velocity_delta(raw_delta[0], raw_delta[1], raw_delta[2], d_theta, act_norm)
-        delta = torch.tensor([obs_norm[1,:], obs_norm[3,:], d_velocity, d_theta])
+        d_theta = self.calc_angular_velocity_delta(raw_delta[:,0], -1*raw_delta[:,1], 
+                                                   raw_delta[:,2], raw_delta[:,3],
+                                                   obs_norm[:,1], act_norm[:,0], 9.81)
+        d_velocity = self.calc_velocity_delta(raw_delta[:,0], -1*raw_delta[:,1], raw_delta[:,2], d_theta, act_norm[:,0])
+
+        delta = torch.stack([obs_norm[:,2], obs_norm[:,3], d_velocity, d_theta], dim=-1)
+
         return delta, hidden
