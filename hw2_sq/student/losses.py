@@ -72,6 +72,50 @@ def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, norm
     return torch.stack(step_losses, dim=1).mean()
 
 
+def denoising_one_step_delta_loss(
+    model,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    normalizer,
+    noise_std: float,
+) -> torch.Tensor:
+    if states.shape[1] != actions.shape[1] + 1:
+        raise ValueError(
+            "denoising one-step loss expects states to have exactly one more time step than actions: "
+            f"got states={states.shape[1]}, actions={actions.shape[1]}."
+        )
+    if float(noise_std) <= 0.0:
+        return one_step_delta_loss(model, states, actions, normalizer)
+
+    obs_std = torch.as_tensor(normalizer.obs_std, dtype=states.dtype, device=states.device)
+    hidden = model.initial_hidden(states.shape[0], states.device)
+    if hidden is None:
+        obs = states[:, :-1].reshape(-1, states.shape[-1])
+        act = actions.reshape(-1, actions.shape[-1])
+        target_next = states[:, 1:].reshape(-1, states.shape[-1])
+        noise_norm = torch.randn_like(obs) * float(noise_std)
+        noisy_obs = obs + noise_norm * obs_std
+        noisy_obs_norm = normalizer.normalize_obs(obs) + noise_norm
+        act_norm = normalizer.normalize_act(act)
+        target_norm = normalizer.normalize_delta(target_next - noisy_obs)
+        pred_norm, _ = model(noisy_obs_norm, act_norm, None)
+        return F.mse_loss(pred_norm, target_norm)
+
+    step_losses = []
+    for t in range(actions.shape[1]):
+        obs = states[:, t]
+        noise_norm = torch.randn_like(obs) * float(noise_std)
+        noisy_obs = obs + noise_norm * obs_std
+        noisy_obs_norm = normalizer.normalize_obs(obs) + noise_norm
+        act_norm = normalizer.normalize_act(actions[:, t])
+        target_norm = normalizer.normalize_delta(states[:, t + 1] - noisy_obs)
+
+        pred_norm, hidden = model(noisy_obs_norm, act_norm, hidden)
+        step_losses.append(F.mse_loss(pred_norm, target_norm, reduction="none"))
+
+    return torch.stack(step_losses, dim=1).mean()
+
+
 def rollout_loss(
     model,
     states: torch.Tensor,
@@ -107,16 +151,18 @@ def rollout_loss(
         pred_norm = normalizer.normalize_obs(preds)
         target_norm = normalizer.normalize_obs(targets)
         per_step_nmse = torch.mean((pred_norm - target_norm) ** 2, dim=-1)
+        # this is for long rollout
         if cap_nmse is not None and float(cap_nmse) > 0.0:
             base = float(cap_nmse) * torch.log1p(per_step_nmse / float(cap_nmse)).mean()
         else:
             base = per_step_nmse.mean()
         roll = base
+        # this is for short rollout
         if margin_threshold is not None and float(margin_weight) > 0.0:
-            margin = F.softplus(20.0 * (per_step_nmse - float(margin_threshold))) / 20.0
+            threshold_loss = F.softplus(20.0 * (per_step_nmse - float(margin_threshold))).mean() / 20.0
             if cap_nmse is not None and float(cap_nmse) > 0.0:
-                margin = torch.clamp(margin, max=float(cap_nmse))
-            roll = roll + float(margin_weight) * margin.mean()
+                threshold_loss = torch.clamp(threshold_loss, max=float(cap_nmse))
+            roll = roll + float(margin_weight) * threshold_loss
         losses.append(roll)
     return torch.stack(losses).mean()
 
@@ -126,6 +172,16 @@ def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
     states = batch["states"]
     actions = batch["actions"]
     one = one_step_delta_loss(model, states, actions, normalizer)
+    if float(loss_cfg.get("denoise_one_step_weight", 0.0)) > 0.0:
+        denoise = denoising_one_step_delta_loss(
+            model,
+            states,
+            actions,
+            normalizer,
+            noise_std=float(loss_cfg.get("denoise_obs_noise_std", 0.02)),
+        )
+    else:
+        denoise = states.new_tensor(0.0)
     update = _next_loss_call(model)
     long_horizon = rollout_curriculum_horizon(loss_cfg, update)
     short_horizon = int(loss_cfg.get("short_rollout_horizon", 0))
@@ -161,12 +217,14 @@ def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
     )
     total = (
         float(loss_cfg.get("one_step_weight", 1.0)) * one
+        + float(loss_cfg.get("denoise_one_step_weight", 0.0)) * denoise
         + float(loss_cfg.get("short_rollout_weight", 0.0)) * short_roll
         + float(loss_cfg.get("rollout_weight", 0.3)) * long_roll
     )
     return total, {
         "loss/total": float(total.detach().cpu()),
         "loss/one_step": float(one.detach().cpu()),
+        "loss/denoise_one_step": float(denoise.detach().cpu()),
         "loss/short_rollout": float(short_roll.detach().cpu()),
         "loss/short_rollout_horizon": float(short_horizon),
         "loss/rollout": float(long_roll.detach().cpu()),
