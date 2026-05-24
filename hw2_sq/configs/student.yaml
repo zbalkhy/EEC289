@@ -4,45 +4,27 @@ torch_num_threads: 1
 
 model:
   hidden_dim: 128
-  num_layers: 4
+  num_layers: 2
   use_gru: false
-  delta_limit: 5.0
 
 training:
   batch_size: 128
-  updates: 8000
+  updates: 2000
   smoke_updates: 120
-  train_sequence_length: 160
-  learning_rate: 7.5e-5
-  grad_clip_norm: 1.0
-  eval_every: 250
+  train_sequence_length: 64
+  learning_rate: 1.0e-3
+  grad_clip_norm: 10.0
+  eval_every: 200
   smoke_eval_every: 20
   val_horizon: 200
-  max_val_windows: 256
+  max_val_windows: 128
   checkpoint_metric: val/VPT80@0.25
   checkpoint_mode: max
 
 loss:
-  one_step_weight: 4.0
-  denoise_one_step_weight: 0.25
-  denoise_obs_noise_std: 0.02
-  short_rollout_weight: 1.0
-  short_rollout_horizon: 15
-  short_rollout_windows_per_batch: 2
-  short_rollout_cap_nmse: 0.0
-  short_rollout_margin_threshold: 0.20
-  short_rollout_margin_weight: 1.0
-  rollout_weight: 0.2
-  rollout_train_horizon: 160
-  rollout_windows_per_batch: 1
-  long_rollout_cap_nmse: 1.0
-
-  rollout_curriculum:
-    enabled: true
-    start_horizon: 15
-    end_horizon: 60
-    warmup_updates: 1500
-    ramp_updates: 5000
+  one_step_weight: 1.0
+  rollout_weight: 1.0
+  rollout_train_horizon: 15
 
 eval:
   warmup_steps: 10
