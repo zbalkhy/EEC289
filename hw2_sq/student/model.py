@@ -37,6 +37,15 @@ class StudentWorldModel(nn.Module):
             return None
         return torch.zeros(batch_size, self.gru.hidden_size, device=device)
 
+    def calc_angular_velocity_delta(self, m1, m2, l, k_t, theta, F, g):
+        total_mass = m1+m2
+        mass_length = m2*l
+
+        return (mass_length*F + total_mass*mass_length*g*theta)/(total_mass*(k_t+ mass_length) - mass_length**2)
+    
+    def calc_velocity_delta(self, m1, m2, l, theta_acc, F):
+        return (m2*l*theta_acc + F)/(m1+m2)
+    
     def forward(self, obs_norm: torch.Tensor, act_norm: torch.Tensor, hidden=None):
         feat = self.encoder(torch.cat([obs_norm, act_norm], dim=-1))
         if self.gru is not None:
@@ -45,5 +54,11 @@ class StudentWorldModel(nn.Module):
             hidden = self.gru(feat, hidden)
             feat = hidden
         raw_delta = self.head(feat)
-        delta = self.delta_limit * torch.tanh(raw_delta / self.delta_limit)
+        
+        # assign raw_delta as [m1, m2, l, k_t]
+        d_theta = self.calc_angular_velocity_delta(raw_delta[0], raw_delta[1], 
+                                                   raw_delta[2], raw_delta[3],
+                                                   obs_norm[0,:], act_norm, 9.81)
+        d_velocity = self.calc_velocity_delta(raw_delta[0], raw_delta[1], raw_delta[2], d_theta, act_norm)
+        delta = torch.tensor([obs_norm[1,:], obs_norm[3,:], d_velocity, d_theta])
         return delta, hidden
