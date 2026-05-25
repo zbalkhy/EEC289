@@ -8,7 +8,14 @@ import torch.nn.functional as F
 from .rollout import open_loop_rollout
 
 
+def _set_model_normalizer(model, normalizer) -> None:
+    set_normalizer = getattr(model, "set_normalizer", None)
+    if set_normalizer is not None:
+        set_normalizer(normalizer)
+
+
 def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer) -> torch.Tensor:
+    _set_model_normalizer(model, normalizer)
     obs = states[:, :-1].reshape(-1, states.shape[-1])
     act = actions.reshape(-1, actions.shape[-1])
     target_delta = (states[:, 1:] - states[:, :-1]).reshape(-1, states.shape[-1])
@@ -20,6 +27,7 @@ def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, norm
 
 
 def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer, warmup_steps: int, horizon: int) -> torch.Tensor:
+    _set_model_normalizer(model, normalizer)
     # Train local open-loop stability at random positions, not only at the
     # beginning of each stored window.
     needed_states = int(warmup_steps) + int(horizon) + 1
