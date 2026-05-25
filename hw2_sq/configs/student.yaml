@@ -4,14 +4,14 @@ torch_num_threads: 1
 
 model:
   hidden_dim: 512
-  num_layers: 4
+  num_layers: 5
   use_gru: true
 
 training:
   batch_size: 128
-  updates: 32000
+  updates: 20000
   smoke_updates: 120
-  train_sequence_length: 128
+  train_sequence_length: 256
   learning_rate: 1.0e-4
   grad_clip_norm: 10.0
   eval_every: 200
@@ -24,7 +24,7 @@ training:
 loss:
   one_step_weight: 1.0
   rollout_weight: 1.0
-  rollout_train_horizon: 50
+  rollout_train_horizon: 70
 
 eval:
   warmup_steps: 10

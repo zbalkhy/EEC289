@@ -21,12 +21,14 @@ class StudentWorldModel(nn.Module):
         use_gru: bool = False,
         delta_limit: float = 3.0,
         dt: float = 0.04,
-        residual_limit: float = 0.5,
+        residual_limit: float = 0.3,
+        physical_update_scale: float = 0.7,
     ):
         super().__init__()
         self.use_gru = bool(use_gru)
         self.delta_limit = float(delta_limit)
         self.residual_limit = float(residual_limit)
+        self.physical_update_scale = float(physical_update_scale)
         in_dim = obs_dim + act_dim
         layers: list[nn.Module] = []
         for _ in range(int(num_layers)):
@@ -36,7 +38,10 @@ class StudentWorldModel(nn.Module):
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) if self.use_gru else None
         self.head = nn.Linear(hidden_dim, obs_dim)
         initial_params = torch.tensor([10.0, 5.0, 0.3, 0.2, 1.0, 1.0], dtype=torch.float32)
-        self.raw_physical_params = nn.Parameter(torch.log(torch.expm1(initial_params)))
+        initial_raw_params = torch.log(torch.expm1(initial_params))
+        self.register_buffer("initial_raw_physical_params", initial_raw_params)
+        # Shared optimizer LR: scale offsets so physical constants learn more slowly than the residual net.
+        self.raw_physical_offsets = nn.Parameter(torch.zeros_like(initial_raw_params))
         self.register_buffer("obs_mean", torch.zeros(obs_dim))
         self.register_buffer("obs_std", torch.ones(obs_dim))
         self.register_buffer("act_mean", torch.zeros(act_dim))
@@ -67,7 +72,8 @@ class StudentWorldModel(nn.Module):
         return torch.zeros(batch_size, self.gru.hidden_size, device=device)
 
     def physical_params(self):
-        return F.softplus(self.raw_physical_params) + 1e-4
+        raw_params = self.initial_raw_physical_params + self.physical_update_scale * self.raw_physical_offsets
+        return F.softplus(raw_params) + 1e-4
 
     def calc_angular_velocity_delta(
         self,

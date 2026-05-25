@@ -70,6 +70,41 @@ def _is_better(value: float, best: float | None, mode: str) -> bool:
     raise ValueError(f"checkpoint_mode must be 'max' or 'min', got {mode!r}.")
 
 
+def _plot(history: list[dict[str, float]], output_path: str | Path, metric_names: list[str] | None = None) -> Path | None:
+    if not history:
+        return None
+    if metric_names is None:
+        keys = {
+            key
+            for row in history
+            for key, value in row.items()
+            if key != "update" and isinstance(value, (float, int))
+        }
+        metric_names = ["loss/total", "VPT80@0.25"] + sorted(key for key in keys if "nMSE" in key)
+    metric_names = [key for key in metric_names if any(key in row for row in history)]
+    if not metric_names:
+        return None
+
+    import matplotlib.pyplot as plt
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    updates = [row["update"] for row in history]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for key in metric_names:
+        values = [row.get(key, np.nan) for row in history]
+        ax.plot(updates, values, marker="o", linewidth=1.5, markersize=3, label=key)
+    ax.set_xlabel("Update")
+    ax.set_ylabel("Metric value")
+    ax.set_yscale("symlog", linthresh=1.0e-3)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    return output_path
+
+
 def train(config_path: str | Path, model_name: str, dataset_dir: str | Path, output_dir: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     cfg = load_config(config_path)
     set_seed(int(cfg.get("seed", 0)))
@@ -92,9 +127,11 @@ def train(config_path: str | Path, model_name: str, dataset_dir: str | Path, out
     max_val_windows = int(cfg["training"].get("max_val_windows", 128))
     checkpoint_metric = str(cfg["training"].get("checkpoint_metric", "val/VPT80@0.25"))
     checkpoint_mode = str(cfg["training"].get("checkpoint_mode", "max"))
+    plot_metrics = cfg["training"].get("plot_metrics")
     rng = np.random.default_rng(int(cfg.get("seed", 0)) + 17)
     best_score: float | None = None
     best_metrics: dict[str, float] = {}
+    metric_history: list[dict[str, float]] = []
     print(f"[train] model={model_name} device={device} updates={updates} smoke={smoke}")
     for update in range(1, updates + 1):
         indices = rng.integers(0, len(train_data["states"]), size=batch_size)
@@ -117,6 +154,9 @@ def train(config_path: str | Path, model_name: str, dataset_dir: str | Path, out
             eval_metrics.pop("per_window_vpt@0.25", None)
             line = " ".join([f"{k}={v:.4f}" for k, v in {**metrics, **eval_metrics}.items() if isinstance(v, (float, int))])
             print(f"[train] update={update} {line}")
+            scalar_metrics = {k: float(v) for k, v in {**metrics, **eval_metrics}.items() if isinstance(v, (float, int))}
+            metric_history.append({"update": float(update), **scalar_metrics})
+            #_plot(metric_history, output_dir / "training_metrics.png", metric_names=plot_metrics)
             score = _checkpoint_score(eval_metrics, checkpoint_metric)
             if _is_better(score, best_score, checkpoint_mode):
                 best_score = score
