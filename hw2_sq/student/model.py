@@ -21,7 +21,7 @@ class StudentWorldModel(nn.Module):
         use_gru: bool = False,
         delta_limit: float = 3.0,
         dt: float = 0.04,
-        residual_limit: float = 0.75,
+        residual_limit: float = 0.5,
     ):
         super().__init__()
         self.use_gru = bool(use_gru)
