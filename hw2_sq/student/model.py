@@ -21,10 +21,12 @@ class StudentWorldModel(nn.Module):
         use_gru: bool = False,
         delta_limit: float = 3.0,
         dt: float = 0.04,
+        residual_limit: float = 1.0,
     ):
         super().__init__()
         self.use_gru = bool(use_gru)
         self.delta_limit = float(delta_limit)
+        self.residual_limit = float(residual_limit)
         in_dim = obs_dim + act_dim
         layers: list[nn.Module] = []
         for _ in range(int(num_layers)):
@@ -32,7 +34,9 @@ class StudentWorldModel(nn.Module):
             in_dim = hidden_dim
         self.encoder = nn.Sequential(*layers)
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) if self.use_gru else None
-        self.head = nn.Linear(hidden_dim, 6)
+        self.head = nn.Linear(hidden_dim, obs_dim)
+        initial_params = torch.tensor([10.0, 5.0, 0.3, 0.2, 1.0, 1.0], dtype=torch.float32)
+        self.raw_physical_params = nn.Parameter(torch.log(torch.expm1(initial_params)))
         self.register_buffer("obs_mean", torch.zeros(obs_dim))
         self.register_buffer("obs_std", torch.ones(obs_dim))
         self.register_buffer("act_mean", torch.zeros(act_dim))
@@ -61,6 +65,9 @@ class StudentWorldModel(nn.Module):
         if not self.use_gru:
             return None
         return torch.zeros(batch_size, self.gru.hidden_size, device=device)
+
+    def physical_params(self):
+        return F.softplus(self.raw_physical_params) + 1e-4
 
     def calc_angular_velocity_delta(
         self,
@@ -95,21 +102,21 @@ class StudentWorldModel(nn.Module):
                 hidden = self.initial_hidden(obs_norm.shape[0], obs_norm.device)
             hidden = self.gru(feat, hidden)
             feat = hidden
-        raw_delta = self.head(feat)
+        raw_residual = self.head(feat)
 
         obs = obs_norm * self.obs_std + self.obs_mean
         act = act_norm * self.act_std + self.act_mean
 
-        # Interpret the network head as positive physical parameters:
+        # Shared positive physical parameters:
         # cart mass, pole mass, pole length, pole inertia, cart friction,
         # and pendulum hinge damping.
-        params = F.softplus(raw_delta) + 1e-4
-        m1 = params[:, 0]
-        m2 = params[:, 1]
-        l = params[:, 2]
-        k_t = params[:, 3]
-        b = params[:, 4]
-        c = params[:, 5]
+        params = self.physical_params()
+        m1 = params[0]
+        m2 = params[1]
+        l = params[2]
+        k_t = params[3]
+        b = params[4]
+        c = params[5]
 
         theta = obs[:, 1]
         x_dot = obs[:, 2]
@@ -134,7 +141,9 @@ class StudentWorldModel(nn.Module):
             [x_dot * self.dt, theta_dot * self.dt, d_velocity * self.dt, d_theta * self.dt],
             dim=-1,
         )
-        delta = (delta_phys - self.delta_mean) / self.delta_std
+        physics_delta = (delta_phys - self.delta_mean) / self.delta_std
+        residual_delta = self.residual_limit * torch.tanh(raw_residual / self.residual_limit)
+        delta = physics_delta + residual_delta
         delta = self.delta_limit * torch.tanh(delta / self.delta_limit)
 
         return delta, hidden
