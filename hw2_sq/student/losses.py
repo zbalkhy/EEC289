@@ -6,9 +6,16 @@ import torch
 import torch.nn.functional as F
 
 from .rollout import open_loop_rollout
-from wm_hw.model_utils import predict_next
+
+
+def _set_model_normalizer(model, normalizer) -> None:
+    set_normalizer = getattr(model, "set_normalizer", None)
+    if set_normalizer is not None:
+        set_normalizer(normalizer)
+
 
 def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer) -> torch.Tensor:
+    _set_model_normalizer(model, normalizer)
     obs = states[:, :-1].reshape(-1, states.shape[-1])
     act = actions.reshape(-1, actions.shape[-1])
     target_delta = (states[:, 1:] - states[:, :-1]).reshape(-1, states.shape[-1])
@@ -20,6 +27,7 @@ def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, norm
 
 
 def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer, warmup_steps: int, horizon: int) -> torch.Tensor:
+    _set_model_normalizer(model, normalizer)
     # Train local open-loop stability at random positions, not only at the
     # beginning of each stored window.
     needed_states = int(warmup_steps) + int(horizon) + 1
@@ -39,21 +47,7 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
     pred_norm = normalizer.normalize_obs(preds)
     target_norm = normalizer.normalize_obs(targets)
-    weights = torch.arange(0, 1, 1/target_norm.shape[1])
-    weights = weights.view(1, target_norm.shape[1], 1).repeat(target_norm.shape[0], 1, target_norm.shape[2]).to(target_norm.device)
-    return F.mse_loss(pred_norm, target_norm, weight=weights)
-
-    # window_losses = []
-    # for i in range(0, max_start, max(max_start // 3, 1)):
-    #     start = i
-    #     sub_states = states[:, start : start + needed_states]
-    #     sub_actions = actions[:, start : start + int(warmup_steps) + int(horizon)]
-    #     preds = open_loop_rollout(model, sub_states, sub_actions, normalizer, warmup_steps=warmup_steps, horizon=horizon)
-    #     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
-    #     pred_norm = normalizer.normalize_obs(preds)
-    #     target_norm = normalizer.normalize_obs(targets)
-    #     window_losses.append((i/max_start)*F.mse_loss(pred_norm, target_norm))
-    # return sum(window_losses)
+    return F.mse_loss(pred_norm, target_norm)
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
