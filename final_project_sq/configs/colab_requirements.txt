@@ -1,0 +1,10 @@
+mujoco
+mujoco_mjx
+brax
+mediapy
+imageio
+imageio-ffmpeg
+matplotlib
+ml-collections
+orbax-checkpoint
+pytest
